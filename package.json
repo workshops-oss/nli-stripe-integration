@@ -1,0 +1,17 @@
+{
+  "name": "nli-stripe-integration",
+  "version": "1.0.0",
+  "description": "Stripe products, prices, and checkout for the Nonprofit Leadership Intensive registration fees (Grassroots / Growing / Established).",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "setup-products": "node setup-products.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "stripe": "^16.8.0"
+  }
+}
