@@ -36,11 +36,26 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
+const { Resend } = require('resend');
+const { buildConfirmationEmail } = require('./email-template');
 
 if (!process.env.STRIPE_SECRET_KEY) {
   console.error('Missing STRIPE_SECRET_KEY. Copy .env.example to .env and fill it in first.');
   process.exit(1);
 }
+
+// These two are needed specifically for the confirmation-email feature.
+// They're checked softly (a warning, not a crash) so the server still
+// runs and takes payments even before email sending is fully set up —
+// see README.md "Confirmation emails" for how to get both values.
+if (!process.env.STRIPE_WEBHOOK_SECRET) {
+  console.warn('⚠ STRIPE_WEBHOOK_SECRET is not set — confirmation emails will not fire. See README.md.');
+}
+if (!process.env.RESEND_API_KEY) {
+  console.warn('⚠ RESEND_API_KEY is not set — confirmation emails will not fire. See README.md.');
+}
+
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const PORT = process.env.PORT || 4242;
@@ -68,8 +83,76 @@ function appendRegistrationLog(record) {
   fs.appendFileSync(LOG_PATH, JSON.stringify(record) + '\n');
 }
 
+// -----------------------------------------------------------------
+// Confirmation email — fires from the webhook above once Stripe
+// confirms payment actually succeeded (not from the browser reaching
+// the /success page, which isn't a reliable signal on its own).
+// -----------------------------------------------------------------
+async function sendConfirmationEmail(session) {
+  if (!resend) {
+    console.warn('Skipping confirmation email — RESEND_API_KEY not configured.');
+    return;
+  }
+  const toEmail = session.customer_details?.email || session.metadata?.contact_email;
+  if (!toEmail) {
+    console.error('No recipient email found on session', session.id);
+    return;
+  }
+
+  const { subject, html } = buildConfirmationEmail({
+    orgName: session.metadata?.org_name,
+    contactName: session.metadata?.contact_name,
+    tier: session.metadata?.tier,
+    attendees: session.metadata?.attendees,
+  });
+
+  await resend.emails.send({
+    // Must be an address on a domain you've verified with Resend —
+    // see README.md "Confirmation emails" before this will work.
+    from: 'Oversight Management <workshops@oversightmanagement.com>',
+    to: toEmail,
+    subject,
+    html,
+  });
+}
+
 const app = express();
 app.use(cors());
+
+// ---------------------------------------------------------------------
+// Stripe webhook — this MUST be registered before express.json() below.
+// Stripe signs each webhook request using the exact raw request body;
+// verifying that signature requires the untouched bytes, not a
+// JSON-parsed object. express.raw() here (route-specific) preserves
+// that raw body for this one route; express.json() further down only
+// applies to every other route registered after it.
+// ---------------------------------------------------------------------
+app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    try {
+      await sendConfirmationEmail(session);
+    } catch (err) {
+      // Don't fail the webhook response over an email problem — Stripe
+      // retries webhooks that return non-2xx, and the payment itself
+      // already succeeded regardless of whether the email goes out.
+      console.error('Confirmation email failed to send:', err.message);
+    }
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -100,6 +183,21 @@ app.post('/create-checkout-session', async (req, res) => {
       line_items,
       success_url: process.env.SUCCESS_URL || 'http://localhost:4242/success?session_id={CHECKOUT_SESSION_ID}',
       cancel_url: process.env.CANCEL_URL || 'http://localhost:4242/#pricing',
+      // Matches the site's navy/red palette and pill-shaped buttons.
+      // logo/icon point at the same file already hosted in /public —
+      // see LOGO_URL note below. font_family is Stripe's closest match
+      // to the site's Public Sans; Stripe's font list doesn't include
+      // it or Newsreader directly (~24 fixed options only).
+      branding_settings: {
+        background_color: '#F3F4F6',
+        button_color: '#9B2D3A',
+        border_style: 'pill',
+        font_family: 'inter',
+        icon: {
+          type: 'url',
+          url: process.env.LOGO_URL || 'https://nli-stripe-integration.onrender.com/nli-mark-reversed.png',
+        },
+      },
       // Stripe metadata values must be short strings — full detail
       // lives in registrations.log via appendRegistrationLog() below.
       // This metadata is just enough to recognize the registration
