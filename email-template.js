@@ -14,8 +14,23 @@ const TIER_LABELS = {
   established: 'Established ($349)',
 };
 
-function buildConfirmationEmail({ orgName, contactName, tier, attendees }) {
+function buildConfirmationEmail({ orgName, contactName, tier, attendees, attendeeNames }) {
   const tierLabel = TIER_LABELS[tier] || tier;
+
+  // attendeeNames comes in as raw text from the form's "one per line"
+  // textarea — split it into individual names, dropping blank lines
+  // and stray whitespace. This field is optional, so the whole
+  // attendeesBlock is skipped entirely if nobody filled it in.
+  const nameList = (attendeeNames || '')
+    .split('\n')
+    .map(n => n.trim())
+    .filter(Boolean);
+  const attendeesBlock = nameList.length
+    ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+        <tr><td style="font-size:13px; font-weight:bold; letter-spacing:1px; text-transform:uppercase; color:#9b2d3a; padding-bottom:8px;">Registered Attendees</td></tr>
+        ${nameList.map(name => `<tr><td style="font-size:14px; line-height:24px; color:#20272f;">• ${name}</td></tr>`).join('')}
+      </table>`
+    : '';
 
   // If you have a standing/recurring Zoom link, set ZOOM_LINK in your
   // environment variables and it'll be included directly below. If
@@ -29,7 +44,7 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees }) {
     ? `<p style="margin:0 0 20px;"><strong>Join link:</strong> <a href="${zoomLink}" style="color:#1c3a5e;">${zoomLink}</a><br /><span style="color:#5b6470; font-size:13px;">Same link both Saturdays.</span></p>`
     : `<p style="margin:0 0 20px; color:#5b6470;">Your Zoom joining details will be emailed separately, closer to the event — no action needed from you right now.</p>`;
 
-  const subject = `You're registered — Nonprofit Leadership Intensive`;
+  const subject = `You're registered for the Nonprofit Leadership Intensive`;
 
   const html = `
   <meta charset="utf-8" />
@@ -37,8 +52,8 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees }) {
     <div style="background-color:#12273f; padding:28px 32px; border-radius:10px 10px 0 0;">
       <table role="presentation" cellpadding="0" cellspacing="0"><tr>
         <td width="40" valign="middle" style="padding-right:12px;">
-          <!-- Placeholder URL — upload nli-mark-reversed-1024.png to your
-               own site/CDN first, then update this src to match. -->
+          <!-- Your real, confirmed live logo URL. If you ever move the
+               backend, update this to match the new domain. -->
           <img src="https://nli-stripe-integration.onrender.com/nli-mark-reversed.png"
                alt="Oversight Management" width="36" height="36"
                style="display:block; width:36px; height:36px; border:0;" />
@@ -51,10 +66,10 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees }) {
     </div>
 
     <div style="border:1px solid #e4e7ec; border-top:none; padding:32px; border-radius:0 0 10px 10px;">
-      <h1 style="font-family:Georgia, 'Times New Roman', serif; font-size:22px; color:#1c3a5e; margin:0 0 16px;">You're registered! 🎉</h1>
+      <h1 style="font-family:Georgia, 'Times New Roman', serif; font-size:22px; color:#1c3a5e; margin:0 0 16px;">You're registered!</h1>
 
       <p style="font-size:15px; line-height:23px; margin:0 0 20px;">
-        Hi ${contactName || 'there'}, thanks for registering <strong>${orgName || 'your organization'}</strong> for the Nonprofit Leadership Intensive. Here's your confirmation.
+        Hi ${contactName || 'there'}! Thanks for registering <strong>${orgName || 'your organization'}</strong> for the Nonprofit Leadership Intensive. Here's your confirmation.
       </p>
 
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f8ebef; border-radius:10px; margin-bottom:20px;">
@@ -70,10 +85,12 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees }) {
         </tr>
       </table>
 
+      ${attendeesBlock}
+
       ${zoomBlock}
 
       <p style="font-size:14px; line-height:22px; color:#5b6470; margin:0 0 20px;">
-        You'll also receive resource docs and materials from both sessions, and referrals to capacity-building service providers are available on request.
+        You'll also receive resource docs and materials after both sessions, and referrals to capacity-building service providers are available on request.
       </p>
 
       <p style="font-size:14px; line-height:22px; margin:0;">

@@ -38,6 +38,7 @@ const cors = require('cors');
 const Stripe = require('stripe');
 const { Resend } = require('resend');
 const { buildConfirmationEmail } = require('./email-template');
+const { appendRegistrantRow } = require('./google-sheets');
 
 if (!process.env.STRIPE_SECRET_KEY) {
   console.error('Missing STRIPE_SECRET_KEY. Copy .env.example to .env and fill it in first.');
@@ -104,6 +105,7 @@ async function sendConfirmationEmail(session) {
     contactName: session.metadata?.contact_name,
     tier: session.metadata?.tier,
     attendees: session.metadata?.attendees,
+    attendeeNames: session.metadata?.attendee_names,
   });
 
   await resend.emails.send({
@@ -140,6 +142,8 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
+    const m = session.metadata || {};
+
     try {
       await sendConfirmationEmail(session);
     } catch (err) {
@@ -147,6 +151,35 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
       // retries webhooks that return non-2xx, and the payment itself
       // already succeeded regardless of whether the email goes out.
       console.error('Confirmation email failed to send:', err.message);
+    }
+
+    try {
+      await appendRegistrantRow({
+        sessionId: session.id,
+        tier: m.tier,
+        attendees: m.attendees,
+        orgName: m.org_name,
+        orgEin: m.org_ein,
+        orgType: m.org_type,
+        mission: m.mission,
+        address1: m.address1,
+        city: m.city,
+        state: m.state,
+        zip: m.zip,
+        website: m.website,
+        contactName: m.contact_name,
+        contactRole: m.contact_role,
+        contactEmail: m.contact_email,
+        contactPhone: m.contact_phone,
+        contact2Name: m.contact2_name,
+        contact2Email: m.contact2_email,
+        contact2Phone: m.contact2_phone,
+        attendeeNames: m.attendee_names,
+      });
+    } catch (err) {
+      // Same reasoning — a Sheets problem shouldn't affect the email,
+      // the payment, or the webhook response to Stripe.
+      console.error('Google Sheets row failed to append:', err.message);
     }
   }
 
@@ -163,6 +196,7 @@ app.post('/create-checkout-session', async (req, res) => {
       orgName, ein, orgType, mission, address1, city, state, zip, website,
       contactName, role, email, phone,
       contact2Name, contact2Email, contact2Phone,
+      attendeeNames,
     } = req.body;
 
     if (!VALID_TIERS.includes(tier)) {
@@ -184,10 +218,13 @@ app.post('/create-checkout-session', async (req, res) => {
       success_url: process.env.SUCCESS_URL || 'http://localhost:4242/success?session_id={CHECKOUT_SESSION_ID}',
       cancel_url: process.env.CANCEL_URL || 'http://localhost:4242/#pricing',
       // Matches the site's navy/red palette and pill-shaped buttons.
-      // logo/icon point at the same file already hosted in /public —
-      // see LOGO_URL note below. font_family is Stripe's closest match
-      // to the site's Public Sans; Stripe's font list doesn't include
-      // it or Newsreader directly (~24 fixed options only).
+      // Uses the PRIMARY (navy/rose) mark, not the reversed white
+      // version — background_color below is light, and a white logo
+      // would be nearly invisible on it. logo/icon point at the same
+      // file hosted in /public — see LOGO_URL note below. font_family
+      // is Stripe's closest match to the site's Public Sans; Stripe's
+      // font list doesn't include it or Newsreader directly (~24 fixed
+      // options only).
       branding_settings: {
         background_color: '#F3F4F6',
         button_color: '#9B2D3A',
@@ -195,20 +232,34 @@ app.post('/create-checkout-session', async (req, res) => {
         font_family: 'inter',
         icon: {
           type: 'url',
-          url: process.env.LOGO_URL || 'https://nli-stripe-integration.onrender.com/nli-mark-reversed.png',
+          url: process.env.LOGO_URL || 'https://nli-stripe-integration.onrender.com/nli-mark.png',
         },
       },
-      // Stripe metadata values must be short strings — full detail
-      // lives in registrations.log via appendRegistrationLog() below.
-      // This metadata is just enough to recognize the registration
-      // from the Stripe Dashboard at a glance.
+      // Expanded to cover everything the Google Sheets directory needs
+      // (see google-sheets.js) — the webhook only has access to this
+      // metadata, not the original form submission, so anything the
+      // sheet or the confirmation email needs has to live here.
+      // Comfortably under Stripe's caps (50 keys, 500 chars/value).
       metadata: {
         tier,
         attendees: String(attendeeCount),
         org_name: (orgName || '').slice(0, 480),
         org_ein: (ein || '').slice(0, 480),
+        org_type: (orgType || '').slice(0, 480),
+        mission: (mission || '').slice(0, 480),
+        address1: (address1 || '').slice(0, 480),
+        city: (city || '').slice(0, 480),
+        state: (state || '').slice(0, 480),
+        zip: (zip || '').slice(0, 480),
+        website: (website || '').slice(0, 480),
         contact_name: (contactName || '').slice(0, 480),
+        contact_role: (role || '').slice(0, 480),
         contact_email: (email || '').slice(0, 480),
+        contact_phone: (phone || '').slice(0, 480),
+        contact2_name: (contact2Name || '').slice(0, 480),
+        contact2_email: (contact2Email || '').slice(0, 480),
+        contact2_phone: (contact2Phone || '').slice(0, 480),
+        attendee_names: (attendeeNames || '').slice(0, 480),
       },
       customer_email: email || undefined,
     });
@@ -217,6 +268,7 @@ app.post('/create-checkout-session', async (req, res) => {
       sessionId: session.id,
       tier,
       attendees: attendeeCount,
+      attendeeNames,
       org: { name: orgName, ein, type: orgType, mission, address1, city, state, zip, website },
       primaryContact: { name: contactName, role, email, phone },
       secondaryContact: { name: contact2Name, email: contact2Email, phone: contact2Phone },

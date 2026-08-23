@@ -4,14 +4,18 @@ Backend for the three registration fee tiers (Grassroots $149 / Growing $249 /
 Established $349), plus a $49 extra-seat add-on. Each tier's Stripe Product
 uses its matching icon from the site's brand set. Also accepts the
 registration form's full intake — organization details, primary and
-secondary contacts.
+secondary contacts — and sends an automatic confirmation email once
+payment actually succeeds.
 
 ```
 stripe-integration/
 ├── package.json
 ├── .env.example          copy to .env and fill in your keys
 ├── setup-products.js     run once — creates Products & Prices in Stripe
-├── server.js             Express server — creates Checkout Sessions
+├── server.js             Express server — creates Checkout Sessions,
+│                         handles the post-payment webhook
+├── email-template.js     the confirmation email's subject + HTML
+├── google-sheets.js      appends each registration to a Google Sheet
 ├── public/icons/         the three tier icons (also used as product images)
 ├── registrations.log     created at runtime — one JSON line per
 │                         submission (NOT committed to git)
@@ -111,6 +115,140 @@ On success, the full submission is appended as one line to
 to the Stripe Checkout Session's metadata, since Stripe metadata fields are
 capped in both count and length.
 
+**POST `/webhook/stripe`**
+
+Called by Stripe itself, not by the front end — see "Confirmation emails"
+below for how to set this up. Verifies the request is genuinely from
+Stripe (using `STRIPE_WEBHOOK_SECRET`), then sends the confirmation email
+when the event type is `checkout.session.completed`.
+
+## Confirmation emails
+
+Once someone completes payment, the server automatically emails them a
+confirmation — organization name, tier, seat count, event dates/times, and
+a note about Zoom. This does **not** fire from the browser reaching the
+`/success` page (that's not reliable — someone could close the tab a
+second after paying, before that page even loads). Instead, it fires from
+a **Stripe webhook**: Stripe calls your server directly, server-to-server,
+the moment it confirms payment actually went through.
+
+Two things to set up before this works:
+
+**1. Get a Resend API key and verify a sending domain.**
+Sign up free at [resend.com](https://resend.com) (3,000 emails/month,
+free permanently — plenty for this). In the Resend dashboard, add
+`oversightmanagement.com` (or whichever domain the `from` address in
+`email-template.js` uses) under **Domains**, and add the DNS records
+Resend gives you (SPF/DKIM, usually 2–3 TXT/CNAME records). Until that
+domain is verified, Resend will only let you send test emails to your
+own account's email address — not to real registrants. Once verified,
+copy your API key from **API Keys** into `RESEND_API_KEY` in `.env`.
+
+**2. Add a Stripe webhook pointing at your deployed server.**
+In the [Stripe Dashboard](https://dashboard.stripe.com/webhooks), click
+**Add endpoint**. For the URL, use your real deployed server's address
+plus `/webhook/stripe` — e.g.
+`https://nli-stripe-integration.onrender.com/webhook/stripe`. This **only works
+once the server is actually deployed somewhere public** — Stripe can't
+reach a `localhost` address, so this step has to wait until after you've
+deployed (see "Going live" below). For the event to listen for, select
+**`checkout.session.completed`**. Once created, Stripe shows you a
+**Signing secret** starting with `whsec_...` — copy that into
+`STRIPE_WEBHOOK_SECRET` in `.env`.
+
+Without either of these set, the server still runs and still takes
+payments — it just logs a warning and skips sending the email, rather
+than breaking checkout over a missing email setup.
+
+**About the Zoom link:** this project doesn't have a real Zoom link on
+file, so the email either includes the standing link you set in
+`ZOOM_LINK` (`.env`), or — if that's left blank, the default — tells
+people their joining details will be sent separately closer to the
+event. That's not a placeholder to feel bad about; sending join links
+24–48 hours out rather than at signup is genuinely the more common
+practice, both for security and so the link doesn't get buried in
+someone's inbox for the six weeks between registering and the event.
+
+**To edit what the email actually says:** everything is in
+`email-template.js` — subject line, wording, and the HTML layout — kept
+separate from `server.js` so you can adjust the copy without touching
+the checkout logic.
+
+## Checkout page branding
+
+By default, Stripe's hosted Checkout page is unbranded. Two ways to fix that.
+
+**Dashboard (no code) —** [dashboard.stripe.com/settings/branding/checkout](https://dashboard.stripe.com/settings/branding/checkout).
+Applies to every Checkout session automatically, and is the fastest way
+to confirm branding is actually working, independent of whatever's
+currently deployed. Use these exact values to match the site:
+
+| Setting | Value |
+|---|---|
+| Icon/logo | Upload `public/nli-mark.png` (the navy/rose version — **not** `nli-mark-reversed.png`, which is white and made for dark backgrounds; it would be invisible on Checkout's light background) |
+| Background color | `#F3F4F6` |
+| Button color | `#9B2D3A` |
+| Corner style | Pill / fully rounded |
+| Font | Closest available match to Public Sans — Inter, if offered |
+
+**Code (`branding_settings` on the Checkout Session, already wired up in
+`server.js`) —** same values as above, applied per-session instead of
+account-wide. Points the icon at `LOGO_URL` in `.env`, which should be
+`nli-mark.png` (not the reversed one) at wherever it's hosted — e.g.
+`https://nli-stripe-integration.onrender.com/nli-mark.png` once you've
+pushed the file in `public/nli-mark.png` to your repo.
+
+One real limitation, not a bug: Stripe's `font_family` option only
+supports a fixed list of about two dozen fonts. Neither Newsreader nor
+Public Sans (the site's actual fonts) are on that list. `inter` is set
+as the closest match to Public Sans; swap it for `lora` in `server.js`
+if you'd rather lean toward the site's serif feel instead.
+
+## Registrant directory (Google Sheets)
+
+Every time a payment actually succeeds (the same `checkout.session.completed`
+webhook that triggers the confirmation email), one row gets appended to a
+Google Sheet — organization, both contacts' names/emails/phones, tier,
+attendee names, everything. This exists because Stripe's own dashboard
+only shows a limited subset of this data (notably: no secondary contact
+email at all), and `registrations.log` on the server isn't something
+you can actually browse or share.
+
+**One-time setup, in order:**
+
+1. **Create a Google Cloud project.** At [console.cloud.google.com](https://console.cloud.google.com),
+   create a new project (or use an existing one).
+2. **Enable the Google Sheets API.** In that project, go to APIs &
+   Services → Library, search "Google Sheets API," and enable it.
+3. **Create a service account.** APIs & Services → Credentials →
+   Create Credentials → Service Account. Give it any name (e.g.
+   "nli-registrant-sheet"). No special roles needed.
+4. **Generate a key for it.** Open the service account you just made →
+   Keys → Add Key → Create new key → JSON. This downloads a `.json`
+   file — open it, you need two values from it:
+   - `client_email` → this is `GOOGLE_SERVICE_ACCOUNT_EMAIL`
+   - `private_key` → this is `GOOGLE_PRIVATE_KEY` (paste the whole
+     thing, including the `-----BEGIN PRIVATE KEY-----` /
+     `-----END PRIVATE KEY-----` lines)
+5. **Create the actual Google Sheet.** Make a new spreadsheet, rename
+   the first tab to exactly `Registrants` (case-sensitive — this must
+   match `SHEET_TAB` in `google-sheets.js`), and paste the column
+   headers from `SHEET_HEADERS` in that same file into row 1.
+6. **Share the sheet with the service account.** Click Share on the
+   spreadsheet, and add the `client_email` address from step 4 as an
+   **Editor** — this is the step people most often miss. Without it,
+   every append attempt fails with a permissions error, since the
+   service account is otherwise a stranger to your sheet.
+7. **Copy the Sheet ID.** It's the long string in the sheet's URL,
+   between `/d/` and `/edit` — that's `GOOGLE_SHEET_ID`.
+8. **Add all three values to Render's environment variables** (not a
+   `.env` file — same as every other secret in this project, these go
+   in the Render dashboard → your web service → Environment).
+
+Like the email and the branding, this fails gracefully if unconfigured
+— checkout and the confirmation email both work fine without it; you
+just won't get directory rows until all three variables are set.
+
 ## Going live
 
 - Swap the `sk_test_…` / `pk_test_…` keys for live keys.
@@ -119,10 +257,9 @@ capped in both count and length.
 - Deploy `server.js` somewhere reachable over HTTPS (Render, Fly.io,
   Railway, a VPS, etc.) and update `CHECKOUT_ENDPOINT` in `index.html`
   and `SUCCESS_URL` / `CANCEL_URL` in `.env` to match.
-- Consider adding a Stripe webhook (`checkout.session.completed`) if you
-  want to trigger your own confirmation email or save the registration
-  to a database the moment payment succeeds, rather than relying only on
-  the success-page redirect.
+- **Now that you have a real deployed URL**, go back and finish the two
+  "Confirmation emails" setup steps above if you haven't already — the
+  Stripe webhook specifically can't be created until this URL exists.
 - **Move `registrations.log` to a real database** once you're past
   testing — a flat file works for checking a handful of signups by hand,
   but doesn't scale and has no query/backup story of its own.
