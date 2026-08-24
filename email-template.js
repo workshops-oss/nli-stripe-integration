@@ -25,6 +25,7 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees, attende
     .split('\n')
     .map(n => n.trim())
     .filter(Boolean);
+
   const attendeesBlock = nameList.length
     ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
         <tr><td style="font-size:13px; font-weight:bold; letter-spacing:1px; text-transform:uppercase; color:#9b2d3a; padding-bottom:8px;">Registered Attendees</td></tr>
@@ -33,16 +34,14 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees, attende
     : '';
 
   // If you have a standing/recurring Zoom link, set ZOOM_LINK in your
-  // environment variables and it'll be included directly below. If
-  // it's not set (the default), the email tells people the link is
-  // coming separately instead — which is genuinely the more common
-  // practice anyway (sending join links 24–48h out, not at signup,
-  // both for security and so the link doesn't get lost in an inbox
-  // over several weeks).
+  // environment variables and it'll be included directly below.
+  // If it's not set, the email tells people their Zoom details
+  // will be sent separately on November 2.
   const zoomLink = process.env.ZOOM_LINK || '';
+
   const zoomBlock = zoomLink
     ? `<p style="margin:0 0 20px;"><strong>Join link:</strong> <a href="${zoomLink}" style="color:#1c3a5e;">${zoomLink}</a><br /><span style="color:#5b6470; font-size:13px;">Same link both Saturdays.</span></p>`
-    : `<p style="margin:0 0 20px; color:#5b6470;">Your Zoom joining details will be emailed separately, closer to the event — no action needed from you right now.</p>`;
+    : `<p style="margin:0 0 20px; color:#5b6470;">Your Zoom joining details will be emailed separately on November 2. No action is needed from you right now.</p>`;
 
   const subject = `You're registered for the Nonprofit Leadership Intensive`;
 
@@ -58,15 +57,24 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees, attende
                alt="Oversight Management" width="36" height="36"
                style="display:block; width:36px; height:36px; border:0;" />
         </td>
+
         <td valign="middle">
-          <div style="font-family:Georgia, 'Times New Roman', serif; font-size:18px; font-weight:bold; color:#ffffff;">Oversight Management</div>
-          <div style="font-size:11px; letter-spacing:2px; text-transform:uppercase; color:#9fb0c4; margin-top:4px;">Nonprofit Leadership Intensive</div>
+          <div style="font-family:Georgia, 'Times New Roman', serif; font-size:18px; font-weight:bold; color:#ffffff;">
+            Oversight Management
+          </div>
+
+          <div style="font-size:11px; letter-spacing:2px; text-transform:uppercase; color:#9fb0c4; margin-top:4px;">
+            Nonprofit Leadership Intensive
+          </div>
         </td>
       </tr></table>
     </div>
 
     <div style="border:1px solid #e4e7ec; border-top:none; padding:32px; border-radius:0 0 10px 10px;">
-      <h1 style="font-family:Georgia, 'Times New Roman', serif; font-size:22px; color:#1c3a5e; margin:0 0 16px;">You're registered!</h1>
+
+      <h1 style="font-family:Georgia, 'Times New Roman', serif; font-size:22px; color:#1c3a5e; margin:0 0 16px;">
+        You're registered!
+      </h1>
 
       <p style="font-size:15px; line-height:23px; margin:0 0 20px;">
         Hi ${contactName || 'there'}! Thanks for registering <strong>${orgName || 'your organization'}</strong> for the Nonprofit Leadership Intensive. Here's your confirmation.
@@ -95,8 +103,11 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees, attende
 
       <p style="font-size:14px; line-height:22px; margin:0;">
         Questions? Just reply to this email, or reach us at
-        <a href="mailto:workshops@oversightmanagement.com" style="color:#1c3a5e; font-weight:600;">workshops@oversightmanagement.com</a>.
+        <a href="mailto:workshops@oversightmanagement.com" style="color:#1c3a5e; font-weight:600;">
+          workshops@oversightmanagement.com
+        </a>.
       </p>
+
     </div>
 
     <p style="font-size:11px; color:#9fb0c4; text-align:center; margin-top:20px;">
