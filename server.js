@@ -38,7 +38,7 @@ const cors = require('cors');
 const Stripe = require('stripe');
 const { Resend } = require('resend');
 const { buildConfirmationEmail } = require('./email-template');
-const { appendRegistrantRow } = require('./google-sheets');
+const { appendRegistrantRows } = require('./google-sheets');
 
 if (!process.env.STRIPE_SECRET_KEY) {
   console.error('Missing STRIPE_SECRET_KEY. Copy .env.example to .env and fill it in first.');
@@ -84,12 +84,31 @@ function appendRegistrationLog(record) {
   fs.appendFileSync(LOG_PATH, JSON.stringify(record) + '\n');
 }
 
+// Stripe metadata caps each value at 500 characters — fine for org/
+// contact fields, but not for a full attendee name+email list (up to
+// 30 people, per the form's own limit). Rather than truncate that
+// data unpredictably, the webhook below reads the complete attendee
+// list back from this log by session ID instead, since the full
+// (untruncated) record was already written here at checkout-session
+// creation time, before Stripe ever calls the webhook.
+function findRegistrationBySessionId(sessionId) {
+  if (!fs.existsSync(LOG_PATH)) return null;
+  const lines = fs.readFileSync(LOG_PATH, 'utf8').split('\n').filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const record = JSON.parse(lines[i]);
+      if (record.sessionId === sessionId) return record;
+    } catch (e) { /* skip a malformed line rather than crash the lookup */ }
+  }
+  return null;
+}
+
 // -----------------------------------------------------------------
 // Confirmation email — fires from the webhook above once Stripe
 // confirms payment actually succeeded (not from the browser reaching
 // the /success page, which isn't a reliable signal on its own).
 // -----------------------------------------------------------------
-async function sendConfirmationEmail(session) {
+async function sendConfirmationEmail(session, attendeesList) {
   if (!resend) {
     console.warn('Skipping confirmation email — RESEND_API_KEY not configured.');
     return;
@@ -105,10 +124,16 @@ async function sendConfirmationEmail(session) {
     contactName: session.metadata?.contact_name,
     tier: session.metadata?.tier,
     attendees: session.metadata?.attendees,
-    attendeeNames: session.metadata?.attendee_names,
+    attendeesList,
   });
 
-  await resend.emails.send({
+  // IMPORTANT: Resend's SDK does not throw on a failed send — it
+  // resolves with { data: null, error: {...} } instead. Awaiting this
+  // without checking `result.error` means a failure would silently
+  // look like success: no exception, nothing logged, and the person
+  // just never gets their email with zero indication anything broke.
+  // Confirmed this the hard way in testing before adding the check.
+  const result = await resend.emails.send({
     // Must be an address on a domain you've verified with Resend —
     // see README.md "Confirmation emails" before this will work.
     from: 'Oversight Management <workshops@oversightmanagement.com>',
@@ -116,6 +141,9 @@ async function sendConfirmationEmail(session) {
     subject,
     html,
   });
+  if (result.error) {
+    throw new Error(`Resend rejected the send: ${result.error.message || JSON.stringify(result.error)}`);
+  }
 }
 
 const app = express();
@@ -143,9 +171,14 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const m = session.metadata || {};
+    const fullRecord = findRegistrationBySessionId(session.id);
+    const attendeesList = fullRecord?.attendeesList || [];
+    if (!fullRecord) {
+      console.warn('No matching registrations.log entry found for session', session.id, '— attendee name/email list will be empty in the email and sheet.');
+    }
 
     try {
-      await sendConfirmationEmail(session);
+      await sendConfirmationEmail(session, attendeesList);
     } catch (err) {
       // Don't fail the webhook response over an email problem — Stripe
       // retries webhooks that return non-2xx, and the payment itself
@@ -154,7 +187,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     }
 
     try {
-      await appendRegistrantRow({
+      await appendRegistrantRows({
         sessionId: session.id,
         tier: m.tier,
         attendees: m.attendees,
@@ -174,12 +207,12 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
         contact2Name: m.contact2_name,
         contact2Email: m.contact2_email,
         contact2Phone: m.contact2_phone,
-        attendeeNames: m.attendee_names,
+        attendeesList,
       });
     } catch (err) {
       // Same reasoning — a Sheets problem shouldn't affect the email,
       // the payment, or the webhook response to Stripe.
-      console.error('Google Sheets row failed to append:', err.message);
+      console.error('Google Sheets rows failed to append:', err.message);
     }
   }
 
@@ -196,7 +229,7 @@ app.post('/create-checkout-session', async (req, res) => {
       orgName, ein, orgType, mission, address1, city, state, zip, website,
       contactName, role, email, phone,
       contact2Name, contact2Email, contact2Phone,
-      attendeeNames,
+      attendeesList,
     } = req.body;
 
     if (!VALID_TIERS.includes(tier)) {
@@ -235,11 +268,14 @@ app.post('/create-checkout-session', async (req, res) => {
           url: process.env.LOGO_URL || 'https://nli-stripe-integration.onrender.com/nli-mark.png',
         },
       },
-      // Expanded to cover everything the Google Sheets directory needs
-      // (see google-sheets.js) — the webhook only has access to this
-      // metadata, not the original form submission, so anything the
-      // sheet or the confirmation email needs has to live here.
-      // Comfortably under Stripe's caps (50 keys, 500 chars/value).
+      // Org/contact fields the Google Sheets directory and confirmation
+      // email need (the webhook only has access to this metadata, not
+      // the original form body). Attendee name/email pairs are
+      // deliberately NOT here — up to 30 people could easily exceed
+      // Stripe's 500-char-per-value cap, so the webhook instead reads
+      // the full attendee list back from registrations.log by session
+      // ID (see findRegistrationBySessionId below). Everything here
+      // stays comfortably under Stripe's limits (50 keys, 500 chars/value).
       metadata: {
         tier,
         attendees: String(attendeeCount),
@@ -259,7 +295,6 @@ app.post('/create-checkout-session', async (req, res) => {
         contact2_name: (contact2Name || '').slice(0, 480),
         contact2_email: (contact2Email || '').slice(0, 480),
         contact2_phone: (contact2Phone || '').slice(0, 480),
-        attendee_names: (attendeeNames || '').slice(0, 480),
       },
       customer_email: email || undefined,
     });
@@ -268,7 +303,7 @@ app.post('/create-checkout-session', async (req, res) => {
       sessionId: session.id,
       tier,
       attendees: attendeeCount,
-      attendeeNames,
+      attendeesList,
       org: { name: orgName, ein, type: orgType, mission, address1, city, state, zip, website },
       primaryContact: { name: contactName, role, email, phone },
       secondaryContact: { name: contact2Name, email: contact2Email, phone: contact2Phone },
@@ -287,10 +322,26 @@ app.post('/create-checkout-session', async (req, res) => {
 // rather keep everything on one domain.
 app.get('/success', (req, res) => {
   res.send(`
-    <!doctype html><html><body style="font-family:sans-serif;max-width:520px;margin:80px auto;text-align:center;">
-      <h1 style="color:#1c3a5e;">You're registered 🎉</h1>
-      <p>Thank you — a confirmation email is on its way.</p>
-    </body></html>
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="UTF-8" />
+      <title>You're registered — Nonprofit Leadership Intensive</title>
+    </head>
+    <body style="margin:0; padding:0; background-color:#F3F4F6; font-family:Arial, Helvetica, sans-serif;">
+      <div style="max-width:480px; margin:80px auto; background:#ffffff; border-radius:10px; box-shadow:0 4px 20px rgba(28,58,94,0.08); overflow:hidden;">
+        <div style="background-color:#12273F; padding:28px 32px;">
+          <div style="font-family:Georgia, 'Times New Roman', serif; font-size:18px; font-weight:bold; color:#ffffff;">Oversight Management</div>
+          <div style="font-size:11px; letter-spacing:2px; text-transform:uppercase; color:#9fb0c4; margin-top:4px;">Nonprofit Leadership Intensive</div>
+        </div>
+        <div style="padding:36px 32px; text-align:center;">
+          <h1 style="font-family:Georgia, 'Times New Roman', serif; font-size:24px; color:#1c3a5e; margin:0 0 16px;">You have registered.</h1>
+          <p style="font-size:15px; line-height:24px; color:#20272f; margin:0 0 8px;">A receipt has been emailed to you.</p>
+          <p style="font-size:15px; line-height:24px; color:#5b6470; margin:0;">Looking forward to seeing you at the Nonprofit Leadership Intensive.</p>
+        </div>
+      </div>
+    </body>
+    </html>
   `);
 });
 

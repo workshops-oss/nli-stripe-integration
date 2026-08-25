@@ -14,34 +14,42 @@ const TIER_LABELS = {
   established: 'Established ($349)',
 };
 
-function buildConfirmationEmail({ orgName, contactName, tier, attendees, attendeeNames }) {
+// Attendee names/emails are free-text user input with no prior
+// sanitization — escape before interpolating into HTML so a stray
+// "<" or "&" in someone's name can't break the email's markup.
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function buildConfirmationEmail({ orgName, contactName, tier, attendees, attendeesList }) {
   const tierLabel = TIER_LABELS[tier] || tier;
 
-  // attendeeNames comes in as raw text from the form's "one per line"
-  // textarea — split it into individual names, dropping blank lines
-  // and stray whitespace. This field is optional, so the whole
-  // attendeesBlock is skipped entirely if nobody filled it in.
-  const nameList = (attendeeNames || '')
-    .split('\n')
-    .map(n => n.trim())
-    .filter(Boolean);
-
-  const attendeesBlock = nameList.length
+  // attendeesList is an array of { name, email } pairs, one per
+  // registered seat — collected from the form's dynamic per-attendee
+  // rows (see index.html). Optional in the sense that it's simply
+  // empty if none were ever recorded (e.g. very old registrations
+  // from before this field existed) — the whole block is skipped then.
+  const validAttendees = (attendeesList || []).filter(a => a && (a.name || a.email));
+  const attendeesBlock = validAttendees.length
     ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
         <tr><td style="font-size:13px; font-weight:bold; letter-spacing:1px; text-transform:uppercase; color:#9b2d3a; padding-bottom:8px;">Registered Attendees</td></tr>
-        ${nameList.map(name => `<tr><td style="font-size:14px; line-height:24px; color:#20272f;">• ${name}</td></tr>`).join('')}
+        ${validAttendees.map(a => `<tr><td style="font-size:14px; line-height:22px; color:#20272f; padding-bottom:6px;">• ${escapeHtml(a.name)} <span style="color:#5b6470;">— ${escapeHtml(a.email)}</span></td></tr>`).join('')}
       </table>`
     : '';
 
   // If you have a standing/recurring Zoom link, set ZOOM_LINK in your
-  // environment variables and it'll be included directly below.
-  // If it's not set, the email tells people their Zoom details
-  // will be sent separately on November 2.
+  // environment variables and it'll be included directly below. If
+  // it's not set (the default), the email tells people the link is
+  // coming separately instead — which is genuinely the more common
+  // practice anyway (sending join links 24–48h out, not at signup,
+  // both for security and so the link doesn't get lost in an inbox
+  // over several weeks).
   const zoomLink = process.env.ZOOM_LINK || '';
-
   const zoomBlock = zoomLink
     ? `<p style="margin:0 0 20px;"><strong>Join link:</strong> <a href="${zoomLink}" style="color:#1c3a5e;">${zoomLink}</a><br /><span style="color:#5b6470; font-size:13px;">Same link both Saturdays.</span></p>`
-    : `<p style="margin:0 0 20px; color:#5b6470;">Your Zoom joining details will be emailed separately on November 2. No action is needed from you right now.</p>`;
+    : `<p style="margin:0 0 20px; color:#5b6470;">You will receive an email with the Zoom link closer to the date of the event, on November 2, 2026. Be sure to check your spam folder.</p>`;
 
   const subject = `You're registered for the Nonprofit Leadership Intensive`;
 
@@ -57,24 +65,15 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees, attende
                alt="Oversight Management" width="36" height="36"
                style="display:block; width:36px; height:36px; border:0;" />
         </td>
-
         <td valign="middle">
-          <div style="font-family:Georgia, 'Times New Roman', serif; font-size:18px; font-weight:bold; color:#ffffff;">
-            Oversight Management
-          </div>
-
-          <div style="font-size:11px; letter-spacing:2px; text-transform:uppercase; color:#9fb0c4; margin-top:4px;">
-            Nonprofit Leadership Intensive
-          </div>
+          <div style="font-family:Georgia, 'Times New Roman', serif; font-size:18px; font-weight:bold; color:#ffffff;">Oversight Management</div>
+          <div style="font-size:11px; letter-spacing:2px; text-transform:uppercase; color:#9fb0c4; margin-top:4px;">Nonprofit Leadership Intensive</div>
         </td>
       </tr></table>
     </div>
 
     <div style="border:1px solid #e4e7ec; border-top:none; padding:32px; border-radius:0 0 10px 10px;">
-
-      <h1 style="font-family:Georgia, 'Times New Roman', serif; font-size:22px; color:#1c3a5e; margin:0 0 16px;">
-        You're registered!
-      </h1>
+      <h1 style="font-family:Georgia, 'Times New Roman', serif; font-size:22px; color:#1c3a5e; margin:0 0 16px;">You're registered!</h1>
 
       <p style="font-size:15px; line-height:23px; margin:0 0 20px;">
         Hi ${contactName || 'there'}! Thanks for registering <strong>${orgName || 'your organization'}</strong> for the Nonprofit Leadership Intensive. Here's your confirmation.
@@ -101,13 +100,14 @@ function buildConfirmationEmail({ orgName, contactName, tier, attendees, attende
         You'll also receive resource docs and materials after both sessions, and referrals to capacity-building service providers are available on request.
       </p>
 
-      <p style="font-size:14px; line-height:22px; margin:0;">
-        Questions? Just reply to this email, or reach us at
-        <a href="mailto:workshops@oversightmanagement.com" style="color:#1c3a5e; font-weight:600;">
-          workshops@oversightmanagement.com
-        </a>.
+      <p style="font-size:14px; line-height:22px; margin:0 0 20px;">
+        We look forward to meeting you at the Nonprofit Leadership Intensive.
       </p>
 
+      <p style="font-size:14px; line-height:22px; margin:0;">
+        Questions? Just reply to this email, or reach us at
+        <a href="mailto:workshops@oversightmanagement.com" style="color:#1c3a5e; font-weight:600;">workshops@oversightmanagement.com</a>.
+      </p>
     </div>
 
     <p style="font-size:11px; color:#9fb0c4; text-align:center; margin-top:20px;">

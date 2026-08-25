@@ -207,12 +207,13 @@ if you'd rather lean toward the site's serif feel instead.
 ## Registrant directory (Google Sheets)
 
 Every time a payment actually succeeds (the same `checkout.session.completed`
-webhook that triggers the confirmation email), one row gets appended to a
-Google Sheet — organization, both contacts' names/emails/phones, tier,
-attendee names, everything. This exists because Stripe's own dashboard
+webhook that triggers the confirmation email), **one row per attendee**
+gets appended to a Google Sheet — so a 3-seat registration adds 3 rows,
+each with that person's own name and email, alongside the shared
+organization/contact context. This exists because Stripe's own dashboard
 only shows a limited subset of this data (notably: no secondary contact
-email at all), and `registrations.log` on the server isn't something
-you can actually browse or share.
+email, and no per-attendee email at all), and `registrations.log` on the
+server isn't something you can actually browse or share.
 
 **One-time setup, in order:**
 
