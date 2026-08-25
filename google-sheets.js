@@ -34,6 +34,19 @@ async function appendRegistrantRows(record) {
   // in a single-line environment variable, so the standard workaround
   // is storing it with literal \n sequences and un-escaping them here.
   const privateKey = GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
+  const crypto = require('crypto');
+
+try {
+  crypto.createPrivateKey({
+    key: privateKey,
+    format: 'pem',
+    type: 'pkcs8',
+  });
+
+  console.log('GOOGLE_PRIVATE_KEY TEST: OK');
+} catch (error) {
+  console.error('GOOGLE_PRIVATE_KEY TEST: FAILED —', error.message);
+}
 
   const auth = new google.auth.JWT(
     GOOGLE_SERVICE_ACCOUNT_EMAIL,
