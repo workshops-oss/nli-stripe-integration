@@ -113,11 +113,33 @@ async function sendConfirmationEmail(session, attendeesList) {
     console.warn('Skipping confirmation email — RESEND_API_KEY not configured.');
     return;
   }
-  const toEmail = session.customer_details?.email || session.metadata?.contact_email;
-  if (!toEmail) {
-    console.error('No recipient email found on session', session.id);
+
+  // Build the recipient list from the attendee data collected
+  // during registration. Remove duplicates and blank emails.
+  const attendeeEmails = (attendeesList || [])
+    .map(attendee => attendee?.email?.trim())
+    .filter(Boolean);
+
+  // Always keep the purchaser/contact email as a fallback.
+  const purchaserEmail =
+    session.customer_details?.email ||
+    session.metadata?.contact_email ||
+    '';
+
+  const recipients = [...new Set([
+    ...attendeeEmails,
+    purchaserEmail.trim(),
+  ].filter(Boolean))];
+
+  if (!recipients.length) {
+    console.error('No recipient emails found for session', session.id);
     return;
   }
+
+  console.log(
+    `Sending confirmation email for ${session.id} to ${recipients.length} recipient(s):`,
+    recipients
+  );
 
   const { subject, html } = buildConfirmationEmail({
     orgName: session.metadata?.org_name,
@@ -127,23 +149,24 @@ async function sendConfirmationEmail(session, attendeesList) {
     attendeesList,
   });
 
-  // IMPORTANT: Resend's SDK does not throw on a failed send — it
-  // resolves with { data: null, error: {...} } instead. Awaiting this
-  // without checking `result.error` means a failure would silently
-  // look like success: no exception, nothing logged, and the person
-  // just never gets their email with zero indication anything broke.
-  // Confirmed this the hard way in testing before adding the check.
   const result = await resend.emails.send({
-    // Must be an address on a domain you've verified with Resend —
-    // see README.md "Confirmation emails" before this will work.
     from: 'Oversight Management <workshops@oversightmanagement.com>',
-    to: toEmail,
+    to: recipients,
     subject,
     html,
   });
+
   if (result.error) {
-    throw new Error(`Resend rejected the send: ${result.error.message || JSON.stringify(result.error)}`);
+    throw new Error(
+      `Resend rejected the send: ${
+        result.error.message || JSON.stringify(result.error)
+      }`
+    );
   }
+
+  console.log(
+    `Confirmation email sent successfully for ${session.id} to ${recipients.length} recipient(s).`
+  );
 }
 
 const app = express();
