@@ -195,7 +195,28 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     const session = event.data.object;
     const m = session.metadata || {};
     const fullRecord = findRegistrationBySessionId(session.id);
-    const attendeesList = fullRecord?.attendeesList || [];
+
+let attendeesList = [];
+
+if (m.attendees_json) {
+  try {
+    attendeesList = JSON.parse(m.attendees_json);
+  } catch (err) {
+    console.error(
+      'Could not parse attendees_json from Stripe metadata:',
+      err.message
+    );
+  }
+}
+
+// Fallback for older registrations that don't have attendees_json.
+if (!attendeesList.length && fullRecord?.attendeesList?.length) {
+  attendeesList = fullRecord.attendeesList;
+}
+
+console.log(
+  `Attendee data found for ${session.id}: ${attendeesList.length} attendee(s)`
+);
     if (!fullRecord) {
       console.warn('No matching registrations.log entry found for session', session.id, '— attendee name/email list will be empty in the email and sheet.');
     }
@@ -267,7 +288,13 @@ app.post('/create-checkout-session', async (req, res) => {
     if (extraSeats > 0) {
       line_items.push({ price: PRICE_IDS.extra_seat, quantity: extraSeats });
     }
+const attendeesJson = JSON.stringify(
+  Array.isArray(attendeesList) ? attendeesList : []
+);
 
+const attendeeMetadata =
+  attendeesJson.length <= 490 ? attendeesJson : '';
+    
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items,
@@ -299,9 +326,11 @@ app.post('/create-checkout-session', async (req, res) => {
       // the full attendee list back from registrations.log by session
       // ID (see findRegistrationBySessionId below). Everything here
       // stays comfortably under Stripe's limits (50 keys, 500 chars/value).
+      
       metadata: {
-        tier,
-        attendees: String(attendeeCount),
+        attendees_json: attendeeMetadata,
+  tier,
+  attendees: String(attendeeCount),
         org_name: (orgName || '').slice(0, 480),
         org_ein: (ein || '').slice(0, 480),
         org_type: (orgType || '').slice(0, 480),
