@@ -17,6 +17,31 @@
  */
 
 const { google } = require('googleapis');
+// Temporary startup diagnostic
+const crypto = require('crypto');
+
+const startupPrivateKey = process.env.GOOGLE_PRIVATE_KEY
+  ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
+  : '';
+
+if (startupPrivateKey) {
+  try {
+    crypto.createPrivateKey({
+      key: startupPrivateKey,
+      format: 'pem',
+      type: 'pkcs8',
+    });
+
+    console.log('GOOGLE_PRIVATE_KEY STARTUP TEST: OK');
+  } catch (error) {
+    console.error(
+      'GOOGLE_PRIVATE_KEY STARTUP TEST: FAILED —',
+      error.message
+    );
+  }
+} else {
+  console.warn('GOOGLE_PRIVATE_KEY STARTUP TEST: MISSING');
+}
 
 const SHEET_TAB = 'Registrants';
 // Must match the number/order of columns in the row below.
@@ -34,19 +59,6 @@ async function appendRegistrantRows(record) {
   // in a single-line environment variable, so the standard workaround
   // is storing it with literal \n sequences and un-escaping them here.
   const privateKey = GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
-  const crypto = require('crypto');
-
-try {
-  crypto.createPrivateKey({
-    key: privateKey,
-    format: 'pem',
-    type: 'pkcs8',
-  });
-
-  console.log('GOOGLE_PRIVATE_KEY TEST: OK');
-} catch (error) {
-  console.error('GOOGLE_PRIVATE_KEY TEST: FAILED —', error.message);
-}
 
   const auth = new google.auth.JWT(
     GOOGLE_SERVICE_ACCOUNT_EMAIL,
