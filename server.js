@@ -12,399 +12,1194 @@
  *      /create-checkout-session.
  *   3. This server:
  *        - writes one line to registrations.log recording the full
- *          submission (a lightweight durable record, since this
- *          project doesn't include a database)
- *        - builds a Stripe Checkout Session — the tier's price as one
- *          line item, plus the $49 extra-seat price repeated for
- *          every seat beyond the 2 included — with the org/contact
- *          details attached as session metadata
+ *          submission
+ *        - builds a Stripe Checkout Session
  *        - returns the Checkout URL
- *   4. The front end redirects the browser to that URL. Stripe hosts
- *      the actual payment page, so card data never touches this
- *      server (keeps you out of PCI scope).
- *
- * Run:
- *   npm install
- *   npm run setup-products     # once, to create Products/Prices
- *   npm start
+ *   4. The front end redirects the browser to Stripe Checkout.
  * ------------------------------------------------------------------
  */
 
 require('dotenv').config();
+
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const { Resend } = require('resend');
+
 const { buildConfirmationEmail } = require('./email-template');
 const { appendRegistrantRows } = require('./google-sheets');
 
 if (!process.env.STRIPE_SECRET_KEY) {
-  console.error('Missing STRIPE_SECRET_KEY. Copy .env.example to .env and fill it in first.');
+  console.error(
+    'Missing STRIPE_SECRET_KEY. Copy .env.example to .env and fill it in first.'
+  );
   process.exit(1);
 }
 
-// These two are needed specifically for the confirmation-email feature.
-// They're checked softly (a warning, not a crash) so the server still
-// runs and takes payments even before email sending is fully set up —
-// see README.md "Confirmation emails" for how to get both values.
 if (!process.env.STRIPE_WEBHOOK_SECRET) {
-  console.warn('⚠ STRIPE_WEBHOOK_SECRET is not set — confirmation emails will not fire. See README.md.');
-}
-if (!process.env.RESEND_API_KEY) {
-  console.warn('⚠ RESEND_API_KEY is not set — confirmation emails will not fire. See README.md.');
+  console.warn(
+    '⚠ STRIPE_WEBHOOK_SECRET is not set — confirmation emails will not fire. See README.md.'
+  );
 }
 
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+if (!process.env.RESEND_API_KEY) {
+  console.warn(
+    '⚠ RESEND_API_KEY is not set — confirmation emails will not fire. See README.md.'
+  );
+}
+
+const resend = process.env.RESEND_API_KEY
+  ? new Resend(process.env.RESEND_API_KEY)
+  : null;
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
 const PORT = process.env.PORT || 4242;
-const INCLUDED_SEATS = 2; // matches the site's registration copy
+
+const INCLUDED_SEATS = 2;
 
 // Price IDs created by setup-products.js
 const priceIdsPath = path.join(__dirname, 'price-ids.json');
+
 if (!fs.existsSync(priceIdsPath)) {
-  console.error('price-ids.json not found. Run `npm run setup-products` first.');
+  console.error(
+    'price-ids.json not found. Run `npm run setup-products` first.'
+  );
   process.exit(1);
 }
-const PRICE_IDS = JSON.parse(fs.readFileSync(priceIdsPath, 'utf8'));
-const VALID_TIERS = ['grassroots', 'growing', 'established'];
+
+const PRICE_IDS = JSON.parse(
+  fs.readFileSync(priceIdsPath, 'utf8')
+);
+
+const VALID_TIERS = [
+  'grassroots',
+  'growing',
+  'established'
+];
+
+const TIER_LABELS_FOR_SUCCESS = {
+  grassroots: 'Grassroots',
+  growing: 'Growing',
+  established: 'Established'
+};
+
 
 // -----------------------------------------------------------------
 // Lightweight durable record of each registration
 // -----------------------------------------------------------------
-// This project doesn't include a database. Each submission gets one
-// JSON line appended here, so nothing is lost even though Stripe's
-// metadata alone (limited field count / length) isn't a real record
-// store. Swap this for a proper database when you're ready to scale
-// past "one small team checking a log file."
-const LOG_PATH = path.join(__dirname, 'registrations.log');
+
+const LOG_PATH = path.join(
+  __dirname,
+  'registrations.log'
+);
+
 function appendRegistrationLog(record) {
-  fs.appendFileSync(LOG_PATH, JSON.stringify(record) + '\n');
+  fs.promises
+    .appendFile(
+      LOG_PATH,
+      JSON.stringify(record) + '\n'
+    )
+    .catch(err =>
+      console.error(
+        'Failed to write registration log:',
+        err.message
+      )
+    );
 }
 
-// Stripe metadata caps each value at 500 characters — fine for org/
-// contact fields, but not for a full attendee name+email list (up to
-// 30 people, per the form's own limit). Rather than truncate that
-// data unpredictably, the webhook below reads the complete attendee
-// list back from this log by session ID instead, since the full
-// (untruncated) record was already written here at checkout-session
-// creation time, before Stripe ever calls the webhook.
+
 function findRegistrationBySessionId(sessionId) {
-  if (!fs.existsSync(LOG_PATH)) return null;
-  const lines = fs.readFileSync(LOG_PATH, 'utf8').split('\n').filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
+  if (!fs.existsSync(LOG_PATH)) {
+    return null;
+  }
+
+  const lines = fs
+    .readFileSync(LOG_PATH, 'utf8')
+    .split('\n')
+    .filter(Boolean);
+
+  for (
+    let i = lines.length - 1;
+    i >= 0;
+    i--
+  ) {
     try {
       const record = JSON.parse(lines[i]);
-      if (record.sessionId === sessionId) return record;
-    } catch (e) { /* skip a malformed line rather than crash the lookup */ }
+
+      if (record.sessionId === sessionId) {
+        return record;
+      }
+
+    } catch (e) {
+      // Skip malformed lines.
+    }
   }
+
   return null;
 }
 
+
 // -----------------------------------------------------------------
-// Confirmation email — fires from the webhook above once Stripe
-// confirms payment actually succeeded (not from the browser reaching
-// the /success page, which isn't a reliable signal on its own).
+// Confirmation email
 // -----------------------------------------------------------------
-async function sendConfirmationEmail(session, attendeesList) {
+
+async function sendConfirmationEmail(
+  session,
+  attendeesList
+) {
   if (!resend) {
-    console.warn('Skipping confirmation email — RESEND_API_KEY not configured.');
+    console.warn(
+      'Skipping confirmation email — RESEND_API_KEY not configured.'
+    );
+
     return;
   }
 
-  // Build the recipient list from the attendee data collected
-  // during registration. Remove duplicates and blank emails.
+
+  // Send the confirmation to every registered attendee.
+  // Fall back to the primary contact for older registrations.
   const attendeeEmails = (attendeesList || [])
-    .map(attendee => attendee?.email?.trim())
+    .map(a =>
+      String(a?.email || '').trim()
+    )
     .filter(Boolean);
 
-  // Always keep the purchaser/contact email as a fallback.
-  const purchaserEmail =
+
+  const fallbackEmail = String(
     session.customer_details?.email ||
     session.metadata?.contact_email ||
-    '';
+    ''
+  ).trim();
 
-  const recipients = [...new Set([
-    ...attendeeEmails,
-    purchaserEmail.trim(),
-  ].filter(Boolean))];
 
-  if (!recipients.length) {
-    console.error('No recipient emails found for session', session.id);
+  const toEmails = [
+    ...new Set(
+      attendeeEmails.length
+        ? attendeeEmails
+        : (
+            fallbackEmail
+              ? [fallbackEmail]
+              : []
+          )
+    )
+  ];
+
+
+  if (!toEmails.length) {
+    console.error(
+      'No recipient email found on session',
+      session.id
+    );
+
     return;
   }
 
-  console.log(
-    `Sending confirmation email for ${session.id} to ${recipients.length} recipient(s):`,
-    recipients
-  );
 
-  const { subject, html } = buildConfirmationEmail({
-    orgName: session.metadata?.org_name,
-    contactName: session.metadata?.contact_name,
-    tier: session.metadata?.tier,
-    attendees: session.metadata?.attendees,
-    attendeesList,
-  });
-
-  const result = await resend.emails.send({
-    from: 'Oversight Management <workshops@oversightmanagement.com>',
-    to: recipients,
+  const {
     subject,
-    html,
+    html
+  } = buildConfirmationEmail({
+    orgName:
+      session.metadata?.org_name,
+
+    contactName:
+      session.metadata?.contact_name,
+
+    tier:
+      session.metadata?.tier,
+
+    attendees:
+      session.metadata?.attendees,
+
+    attendeesList
   });
+
+
+  const result =
+    await resend.emails.send({
+      from:
+        'Oversight Management <workshops@oversightmanagement.com>',
+
+      to: toEmails,
+
+      subject,
+
+      html
+    });
+
 
   if (result.error) {
     throw new Error(
       `Resend rejected the send: ${
-        result.error.message || JSON.stringify(result.error)
+        result.error.message ||
+        JSON.stringify(result.error)
       }`
     );
   }
-
-  console.log(
-    `Confirmation email sent successfully for ${session.id} to ${recipients.length} recipient(s).`
-  );
 }
+
+
+// -----------------------------------------------------------------
+// Express
+// -----------------------------------------------------------------
 
 const app = express();
+
 app.use(cors());
 
-// ---------------------------------------------------------------------
-// Stripe webhook — this MUST be registered before express.json() below.
-// Stripe signs each webhook request using the exact raw request body;
-// verifying that signature requires the untouched bytes, not a
-// JSON-parsed object. express.raw() here (route-specific) preserves
-// that raw body for this one route; express.json() further down only
-// applies to every other route registered after it.
-// ---------------------------------------------------------------------
-app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
 
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+// -----------------------------------------------------------------
+// Stripe webhook
+// MUST be registered before express.json()
+// -----------------------------------------------------------------
+
+app.post(
+  '/webhook/stripe',
+  express.raw({
+    type: 'application/json'
+  }),
+  async (req, res) => {
+
+    const sig =
+      req.headers['stripe-signature'];
+
+    let event;
+
+
+    try {
+
+      event =
+        stripe.webhooks.constructEvent(
+          req.body,
+          sig,
+          process.env.STRIPE_WEBHOOK_SECRET
+        );
+
+    } catch (err) {
+
+      console.error(
+        'Webhook signature verification failed:',
+        err.message
+      );
+
+      return res
+        .status(400)
+        .send(
+          `Webhook Error: ${err.message}`
+        );
+    }
+
+
+    if (
+      event.type ===
+      'checkout.session.completed'
+    ) {
+
+      const session =
+        event.data.object;
+
+      const m =
+        session.metadata || {};
+
+
+      const fullRecord =
+        findRegistrationBySessionId(
+          session.id
+        );
+
+
+      let attendeesList = [];
+
+
+      // New registrations carry the attendee list
+      // directly in Stripe metadata.
+
+      if (m.attendees_json) {
+
+        try {
+
+          attendeesList =
+            JSON.parse(
+              m.attendees_json
+            );
+
+        } catch (err) {
+
+          console.error(
+            'Could not parse attendees_json from Stripe metadata:',
+            err.message
+          );
+        }
+      }
+
+
+      // Fallback for older registrations.
+
+      if (
+        !attendeesList.length &&
+        fullRecord?.attendeesList?.length
+      ) {
+
+        attendeesList =
+          fullRecord.attendeesList;
+      }
+
+
+      console.log(
+        `Attendee data found for ${session.id}: ${attendeesList.length} attendee(s)`
+      );
+
+
+      if (
+        !fullRecord &&
+        !attendeesList.length
+      ) {
+
+        console.warn(
+          'No matching registration or attendee metadata found for session',
+          session.id
+        );
+      }
+
+
+      // -------------------------------------------------------------
+      // Confirmation email
+      // -------------------------------------------------------------
+
+      try {
+
+        await sendConfirmationEmail(
+          session,
+          attendeesList
+        );
+
+      } catch (err) {
+
+        console.error(
+          'Confirmation email failed to send:',
+          err.message
+        );
+      }
+
+
+      // -------------------------------------------------------------
+      // Google Sheets
+      // -------------------------------------------------------------
+
+      try {
+
+        await appendRegistrantRows({
+
+          sessionId:
+            session.id,
+
+          tier:
+            m.tier,
+
+          attendees:
+            m.attendees,
+
+          orgName:
+            m.org_name,
+
+          orgEin:
+            m.org_ein,
+
+          orgType:
+            m.org_type,
+
+          mission:
+            m.mission,
+
+          address1:
+            m.address1,
+
+          city:
+            m.city,
+
+          state:
+            m.state,
+
+          zip:
+            m.zip,
+
+          website:
+            m.website,
+
+          contactName:
+            m.contact_name,
+
+          contactRole:
+            m.contact_role,
+
+          contactEmail:
+            m.contact_email,
+
+          contactPhone:
+            m.contact_phone,
+
+          contact2Name:
+            m.contact2_name,
+
+          contact2Email:
+            m.contact2_email,
+
+          contact2Phone:
+            m.contact2_phone,
+
+          attendeesList
+        });
+
+      } catch (err) {
+
+        console.error(
+          'Google Sheets rows failed to append:',
+          err.message
+        );
+      }
+    }
+
+
+    res.json({
+      received: true
+    });
   }
-
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const m = session.metadata || {};
-    const fullRecord = findRegistrationBySessionId(session.id);
-
-let attendeesList = [];
-
-if (m.attendees_json) {
-  try {
-    attendeesList = JSON.parse(m.attendees_json);
-  } catch (err) {
-    console.error(
-      'Could not parse attendees_json from Stripe metadata:',
-      err.message
-    );
-  }
-}
-
-// Fallback for older registrations that don't have attendees_json.
-if (!attendeesList.length && fullRecord?.attendeesList?.length) {
-  attendeesList = fullRecord.attendeesList;
-}
-
-console.log(
-  `Attendee data found for ${session.id}: ${attendeesList.length} attendee(s)`
 );
-    if (!fullRecord) {
-      console.warn('No matching registrations.log entry found for session', session.id, '— attendee name/email list will be empty in the email and sheet.');
-    }
 
-    try {
-      await sendConfirmationEmail(session, attendeesList);
-    } catch (err) {
-      // Don't fail the webhook response over an email problem — Stripe
-      // retries webhooks that return non-2xx, and the payment itself
-      // already succeeded regardless of whether the email goes out.
-      console.error('Confirmation email failed to send:', err.message);
-    }
-
-    try {
-      await appendRegistrantRows({
-        sessionId: session.id,
-        tier: m.tier,
-        attendees: m.attendees,
-        orgName: m.org_name,
-        orgEin: m.org_ein,
-        orgType: m.org_type,
-        mission: m.mission,
-        address1: m.address1,
-        city: m.city,
-        state: m.state,
-        zip: m.zip,
-        website: m.website,
-        contactName: m.contact_name,
-        contactRole: m.contact_role,
-        contactEmail: m.contact_email,
-        contactPhone: m.contact_phone,
-        contact2Name: m.contact2_name,
-        contact2Email: m.contact2_email,
-        contact2Phone: m.contact2_phone,
-        attendeesList,
-      });
-    } catch (err) {
-      // Same reasoning — a Sheets problem shouldn't affect the email,
-      // the payment, or the webhook response to Stripe.
-      console.error('Google Sheets rows failed to append:', err.message);
-    }
-  }
-
-  res.json({ received: true });
-});
 
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
-app.post('/create-checkout-session', async (req, res) => {
-  try {
-    const {
-      tier, attendees,
-      orgName, ein, orgType, mission, address1, city, state, zip, website,
-      contactName, role, email, phone,
-      contact2Name, contact2Email, contact2Phone,
-      attendeesList,
-    } = req.body;
-
-    if (!VALID_TIERS.includes(tier)) {
-      return res.status(400).json({ error: `tier must be one of: ${VALID_TIERS.join(', ')}` });
-    }
-    const attendeeCount = Math.max(1, parseInt(attendees, 10) || INCLUDED_SEATS);
-    const extraSeats = Math.max(0, attendeeCount - INCLUDED_SEATS);
-
-    const line_items = [
-      { price: PRICE_IDS[tier], quantity: 1 },
-    ];
-    if (extraSeats > 0) {
-      line_items.push({ price: PRICE_IDS.extra_seat, quantity: extraSeats });
-    }
-const attendeesJson = JSON.stringify(
-  Array.isArray(attendeesList) ? attendeesList : []
+app.use(
+  express.static(
+    path.join(__dirname, 'public')
+  )
 );
 
-const attendeeMetadata =
-  attendeesJson.length <= 490 ? attendeesJson : '';
-    
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      line_items,
-      success_url: process.env.SUCCESS_URL || 'http://localhost:4242/success?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: process.env.CANCEL_URL || 'http://localhost:4242/#pricing',
-      // Matches the site's navy/red palette and pill-shaped buttons.
-      // Uses the PRIMARY (navy/rose) mark, not the reversed white
-      // version — background_color below is light, and a white logo
-      // would be nearly invisible on it. logo/icon point at the same
-      // file hosted in /public — see LOGO_URL note below. font_family
-      // is Stripe's closest match to the site's Public Sans; Stripe's
-      // font list doesn't include it or Newsreader directly (~24 fixed
-      // options only).
-      branding_settings: {
-        background_color: '#F3F4F6',
-        button_color: '#9B2D3A',
-        border_style: 'pill',
-        font_family: 'inter',
-        icon: {
-          type: 'url',
-          url: process.env.LOGO_URL || 'https://nli-stripe-integration.onrender.com/nli-mark.png',
+
+// -----------------------------------------------------------------
+// Create Stripe Checkout Session
+// -----------------------------------------------------------------
+
+app.post(
+  '/create-checkout-session',
+  async (req, res) => {
+
+    try {
+
+      const {
+        tier,
+        attendees,
+
+        orgName,
+        ein,
+        orgType,
+        mission,
+        address1,
+        city,
+        state,
+        zip,
+        website,
+
+        contactName,
+        role,
+        email,
+        phone,
+
+        contact2Name,
+        contact2Email,
+        contact2Phone,
+
+        attendeesList
+
+      } = req.body;
+
+
+      if (
+        !VALID_TIERS.includes(tier)
+      ) {
+
+        return res
+          .status(400)
+          .json({
+            error:
+              `tier must be one of: ${VALID_TIERS.join(', ')}`
+          });
+      }
+
+
+      const attendeeCount =
+        Math.max(
+          1,
+          parseInt(attendees, 10) ||
+          INCLUDED_SEATS
+        );
+
+
+      const extraSeats =
+        Math.max(
+          0,
+          attendeeCount -
+          INCLUDED_SEATS
+        );
+
+
+      const line_items = [
+
+        {
+          price:
+            PRICE_IDS[tier],
+
+          quantity: 1
+        }
+
+      ];
+
+
+      if (extraSeats > 0) {
+
+        line_items.push({
+
+          price:
+            PRICE_IDS.extra_seat,
+
+          quantity:
+            extraSeats
+        });
+      }
+
+
+      // -------------------------------------------------------------
+      // Store attendee list in Stripe metadata when it fits.
+      // -------------------------------------------------------------
+
+      const attendeesJson =
+        JSON.stringify(
+          Array.isArray(attendeesList)
+            ? attendeesList
+            : []
+        );
+
+
+      const attendeeMetadata =
+        attendeesJson.length <= 490
+          ? attendeesJson
+          : '';
+
+
+      // -------------------------------------------------------------
+      // Create Stripe Checkout Session
+      // -------------------------------------------------------------
+
+      const session =
+        await stripe.checkout.sessions.create({
+
+          mode: 'payment',
+
+          line_items,
+
+          success_url:
+            process.env.SUCCESS_URL ||
+            'http://localhost:4242/success?session_id={CHECKOUT_SESSION_ID}',
+
+          cancel_url:
+            process.env.CANCEL_URL ||
+            'http://localhost:4242/#pricing',
+
+
+          branding_settings: {
+
+            background_color:
+              '#F3F4F6',
+
+            button_color:
+              '#9B2D3A',
+
+            border_style:
+              'pill',
+
+            font_family:
+              'inter',
+
+            icon: {
+
+              type: 'url',
+
+              url:
+                process.env.LOGO_URL ||
+                'https://nli-stripe-integration.onrender.com/nli-mark.png'
+            }
+          },
+
+
+          metadata: {
+
+            attendees_json:
+              attendeeMetadata,
+
+            tier,
+
+            attendees:
+              String(attendeeCount),
+
+            org_name:
+              (orgName || '')
+                .slice(0, 480),
+
+            org_ein:
+              (ein || '')
+                .slice(0, 480),
+
+            org_type:
+              (orgType || '')
+                .slice(0, 480),
+
+            mission:
+              (mission || '')
+                .slice(0, 480),
+
+            address1:
+              (address1 || '')
+                .slice(0, 480),
+
+            city:
+              (city || '')
+                .slice(0, 480),
+
+            state:
+              (state || '')
+                .slice(0, 480),
+
+            zip:
+              (zip || '')
+                .slice(0, 480),
+
+            website:
+              (website || '')
+                .slice(0, 480),
+
+            contact_name:
+              (contactName || '')
+                .slice(0, 480),
+
+            contact_role:
+              (role || '')
+                .slice(0, 480),
+
+            contact_email:
+              (email || '')
+                .slice(0, 480),
+
+            contact_phone:
+              (phone || '')
+                .slice(0, 480),
+
+            contact2_name:
+              (contact2Name || '')
+                .slice(0, 480),
+
+            contact2_email:
+              (contact2Email || '')
+                .slice(0, 480),
+
+            contact2_phone:
+              (contact2Phone || '')
+                .slice(0, 480)
+          },
+
+
+          customer_email:
+            email || undefined
+
+        });
+
+
+      // -------------------------------------------------------------
+      // Save complete registration record.
+      // -------------------------------------------------------------
+
+      appendRegistrationLog({
+
+        sessionId:
+          session.id,
+
+        tier,
+
+        attendees:
+          attendeeCount,
+
+        attendeesList,
+
+        org: {
+
+          name:
+            orgName,
+
+          ein,
+
+          type:
+            orgType,
+
+          mission,
+
+          address1,
+
+          city,
+
+          state,
+
+          zip,
+
+          website
         },
-      },
-      // Org/contact fields the Google Sheets directory and confirmation
-      // email need (the webhook only has access to this metadata, not
-      // the original form body). Attendee name/email pairs are
-      // deliberately NOT here — up to 30 people could easily exceed
-      // Stripe's 500-char-per-value cap, so the webhook instead reads
-      // the full attendee list back from registrations.log by session
-      // ID (see findRegistrationBySessionId below). Everything here
-      // stays comfortably under Stripe's limits (50 keys, 500 chars/value).
-      
-      metadata: {
-        attendees_json: attendeeMetadata,
-  tier,
-  attendees: String(attendeeCount),
-        org_name: (orgName || '').slice(0, 480),
-        org_ein: (ein || '').slice(0, 480),
-        org_type: (orgType || '').slice(0, 480),
-        mission: (mission || '').slice(0, 480),
-        address1: (address1 || '').slice(0, 480),
-        city: (city || '').slice(0, 480),
-        state: (state || '').slice(0, 480),
-        zip: (zip || '').slice(0, 480),
-        website: (website || '').slice(0, 480),
-        contact_name: (contactName || '').slice(0, 480),
-        contact_role: (role || '').slice(0, 480),
-        contact_email: (email || '').slice(0, 480),
-        contact_phone: (phone || '').slice(0, 480),
-        contact2_name: (contact2Name || '').slice(0, 480),
-        contact2_email: (contact2Email || '').slice(0, 480),
-        contact2_phone: (contact2Phone || '').slice(0, 480),
-      },
-      customer_email: email || undefined,
-    });
 
-    appendRegistrationLog({
-      sessionId: session.id,
-      tier,
-      attendees: attendeeCount,
-      attendeesList,
-      org: { name: orgName, ein, type: orgType, mission, address1, city, state, zip, website },
-      primaryContact: { name: contactName, role, email, phone },
-      secondaryContact: { name: contact2Name, email: contact2Email, phone: contact2Phone },
-      createdAt: new Date().toISOString(),
-    });
 
-    res.json({ url: session.url });
-  } catch (err) {
-    console.error('Checkout session error:', err.message);
-    res.status(400).json({ error: err.message || 'Could not start checkout. Please try again.' });
+        primaryContact: {
+
+          name:
+            contactName,
+
+          role,
+
+          email,
+
+          phone
+        },
+
+
+        secondaryContact: {
+
+          name:
+            contact2Name,
+
+          email:
+            contact2Email,
+
+          phone:
+            contact2Phone
+        },
+
+
+        createdAt:
+          new Date().toISOString()
+
+      });
+
+
+      res.json({
+        url:
+          session.url
+      });
+
+
+    } catch (err) {
+
+      console.error(
+        'Checkout session error:',
+        err.message
+      );
+
+      res
+        .status(400)
+        .json({
+          error:
+            err.message ||
+            'Could not start checkout. Please try again.'
+        });
+    }
   }
-});
+);
 
-// Simple landing page after a successful payment. Swap this for a
-// redirect back to your real site's confirmation section if you'd
-// rather keep everything on one domain.
-app.get('/success', (req, res) => {
-  res.send(`
+
+// -----------------------------------------------------------------
+// Success page
+// -----------------------------------------------------------------
+
+function successPage({
+  heading,
+  lines,
+  isError
+}) {
+
+  return `
     <!doctype html>
+
     <html>
+
     <head>
+
       <meta charset="UTF-8" />
-      <title>You're registered — Nonprofit Leadership Intensive</title>
+
+      <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+      />
+
+      <title>
+        ${
+          isError
+            ? 'Registration status'
+            : "You're registered"
+        }
+        — Nonprofit Leadership Intensive
+      </title>
+
     </head>
-    <body style="margin:0; padding:0; background-color:#F3F4F6; font-family:Arial, Helvetica, sans-serif;">
-      <div style="max-width:480px; margin:80px auto; background:#ffffff; border-radius:10px; box-shadow:0 4px 20px rgba(28,58,94,0.08); overflow:hidden;">
-        <div style="background-color:#12273F; padding:28px 32px;">
-          <div style="font-family:Georgia, 'Times New Roman', serif; font-size:18px; font-weight:bold; color:#ffffff;">Oversight Management</div>
-          <div style="font-size:11px; letter-spacing:2px; text-transform:uppercase; color:#9fb0c4; margin-top:4px;">Nonprofit Leadership Intensive</div>
+
+
+    <body
+      style="
+        margin:0;
+        padding:0;
+        background-color:#F3F4F6;
+        font-family:Arial, Helvetica, sans-serif;
+      "
+    >
+
+      <div
+        style="
+          max-width:480px;
+          margin:80px auto;
+          background:#ffffff;
+          border-radius:10px;
+          box-shadow:0 4px 20px rgba(28,58,94,0.08);
+          overflow:hidden;
+        "
+      >
+
+        <div
+          style="
+            background-color:#12273F;
+            padding:28px 32px;
+          "
+        >
+
+          <div
+            style="
+              font-family:Georgia, 'Times New Roman', serif;
+              font-size:18px;
+              font-weight:bold;
+              color:#ffffff;
+            "
+          >
+            Oversight Management
+          </div>
+
+
+          <div
+            style="
+              font-size:11px;
+              letter-spacing:2px;
+              text-transform:uppercase;
+              color:#9fb0c4;
+              margin-top:4px;
+            "
+          >
+            Nonprofit Leadership Intensive
+          </div>
+
         </div>
-        <div style="padding:36px 32px; text-align:center;">
-          <h1 style="font-family:Georgia, 'Times New Roman', serif; font-size:24px; color:#1c3a5e; margin:0 0 16px;">You have registered.</h1>
-          <p style="font-size:15px; line-height:24px; color:#20272f; margin:0 0 8px;">A receipt has been emailed to you.</p>
-          <p style="font-size:15px; line-height:24px; color:#5b6470; margin:0;">Looking forward to seeing you at the Nonprofit Leadership Intensive.</p>
+
+
+        <div
+          style="
+            padding:36px 32px;
+            text-align:center;
+          "
+        >
+
+          <h1
+            style="
+              font-family:Georgia, 'Times New Roman', serif;
+              font-size:24px;
+              color:${
+                isError
+                  ? '#9b2d3a'
+                  : '#1c3a5e'
+              };
+              margin:0 0 16px;
+            "
+          >
+            ${heading}
+          </h1>
+
+
+          ${
+            lines
+              .map(
+                l => `
+                  <p
+                    style="
+                      font-size:15px;
+                      line-height:24px;
+                      color:${
+                        l.muted
+                          ? '#5b6470'
+                          : '#20272f'
+                      };
+                      margin:0 0 8px;
+                    "
+                  >
+                    ${l.text}
+                  </p>
+                `
+              )
+              .join('')
+          }
+
         </div>
+
       </div>
+
     </body>
+
     </html>
-  `);
-});
+  `;
+}
 
-// Clean JSON error responses instead of a raw HTML error page.
-app.use((err, req, res, next) => {
-  if (err) {
-    return res.status(400).json({ error: err.message || 'Something went wrong.' });
+
+// -----------------------------------------------------------------
+// Stripe success verification
+// -----------------------------------------------------------------
+
+app.get(
+  '/success',
+  async (req, res) => {
+
+    const sessionId =
+      req.query.session_id;
+
+
+    // No session ID.
+    if (!sessionId) {
+
+      return res
+        .status(400)
+        .send(
+          successPage({
+
+            heading:
+              "We can't confirm a registration here.",
+
+            isError:
+              true,
+
+            lines: [
+
+              {
+                text:
+                  "This page didn't receive a valid session — if you just completed checkout, please check your email for confirmation instead."
+              },
+
+              {
+                text:
+                  "Still not sure? Email workshops@oversightmanagement.com and we'll look into it.",
+
+                muted:
+                  true
+              }
+
+            ]
+
+          })
+        );
+    }
+
+
+    try {
+
+      // Ask Stripe directly whether this
+      // specific session was actually paid.
+
+      const session =
+        await stripe.checkout.sessions.retrieve(
+          sessionId
+        );
+
+
+      if (
+        session.payment_status !== 'paid'
+      ) {
+
+        return res
+          .status(200)
+          .send(
+            successPage({
+
+              heading:
+                'Payment not yet complete.',
+
+              isError:
+                true,
+
+              lines: [
+
+                {
+                  text:
+                    `Status: ${session.payment_status}. If you completed payment and are seeing this, please email workshops@oversightmanagement.com with this reference:`
+                },
+
+                {
+                  text:
+                    sessionId,
+
+                  muted:
+                    true
+                }
+
+              ]
+
+            })
+          );
+      }
+
+
+      const orgName =
+        session.metadata?.org_name ||
+        'your organization';
+
+
+      const tierLabel =
+        TIER_LABELS_FOR_SUCCESS[
+          session.metadata?.tier
+        ] ||
+        session.metadata?.tier ||
+        '';
+
+
+      const amount =
+        typeof session.amount_total === 'number'
+
+          ? `$${(
+              session.amount_total /
+              100
+            ).toFixed(2)}`
+
+          : '';
+
+
+      res.send(
+        successPage({
+
+          heading:
+            'You have registered.',
+
+          lines: [
+
+            {
+              text:
+                `<strong>${orgName}</strong> is confirmed for the Nonprofit Leadership Intensive${
+                  tierLabel
+                    ? ` — ${tierLabel} tier`
+                    : ''
+                }${
+                  amount
+                    ? `, ${amount} paid`
+                    : ''
+                }.`
+            },
+
+            {
+              text:
+                'A receipt has been emailed to you.',
+
+              muted:
+                true
+            },
+
+            {
+              text:
+                'Looking forward to seeing you at the Nonprofit Leadership Intensive.',
+
+              muted:
+                true
+            }
+
+          ]
+
+        })
+      );
+
+
+    } catch (err) {
+
+      console.error(
+        'Could not verify checkout session on /success:',
+        err.message
+      );
+
+
+      res
+        .status(500)
+        .send(
+          successPage({
+
+            heading:
+              "We couldn't verify this registration.",
+
+            isError:
+              true,
+
+            lines: [
+
+              {
+                text:
+                  'If you just completed payment, please check your email for confirmation — your registration may still have gone through.'
+              },
+
+              {
+                text:
+                  "If you don't receive one shortly, email workshops@oversightmanagement.com for help.",
+
+                muted:
+                  true
+              }
+
+            ]
+
+          })
+        );
+    }
   }
-  next();
-});
+);
 
-app.listen(PORT, () => {
-  console.log(`Checkout server running at http://localhost:${PORT}`);
-});
+
+// -----------------------------------------------------------------
+// JSON error handler
+// -----------------------------------------------------------------
+
+app.use(
+  (err, req, res, next) => {
+
+    if (err) {
+
+      return res
+        .status(400)
+        .json({
+          error:
+            err.message ||
+            'Something went wrong.'
+        });
+    }
+
+    next();
+  }
+);
+
+
+// -----------------------------------------------------------------
+// Start server
+// -----------------------------------------------------------------
+
+app.listen(
+  PORT,
+  () => {
+
+    console.log(
+      `Checkout server running at http://localhost:${PORT}`
+    );
+
+  }
+);
