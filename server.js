@@ -16,6 +16,9 @@
  *        - builds a Stripe Checkout Session
  *        - returns the Checkout URL
  *   4. The front end redirects the browser to Stripe Checkout.
+ *
+ * Confirmation emails are sent by the Stripe webhook after payment
+ * is actually completed.
  * ------------------------------------------------------------------
  */
 
@@ -27,58 +30,85 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const { Resend } = require('resend');
-
 const { buildConfirmationEmail } = require('./email-template');
 const { appendRegistrantRows } = require('./google-sheets');
+
+
+// ------------------------------------------------------------------
+// Environment checks
+// ------------------------------------------------------------------
 
 if (!process.env.STRIPE_SECRET_KEY) {
   console.error(
     'Missing STRIPE_SECRET_KEY. Copy .env.example to .env and fill it in first.'
   );
+
   process.exit(1);
 }
 
+
+// These are needed for confirmation emails.
+// The server will still start if they are missing.
+
 if (!process.env.STRIPE_WEBHOOK_SECRET) {
   console.warn(
-    '⚠ STRIPE_WEBHOOK_SECRET is not set — confirmation emails will not fire. See README.md.'
+    '⚠ STRIPE_WEBHOOK_SECRET is not set — confirmation emails will not fire.'
   );
 }
 
 if (!process.env.RESEND_API_KEY) {
   console.warn(
-    '⚠ RESEND_API_KEY is not set — confirmation emails will not fire. See README.md.'
+    '⚠ RESEND_API_KEY is not set — confirmation emails will not fire.'
   );
 }
 
-const resend = process.env.RESEND_API_KEY
-  ? new Resend(process.env.RESEND_API_KEY)
-  : null;
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const resend =
+  process.env.RESEND_API_KEY
+    ? new Resend(process.env.RESEND_API_KEY)
+    : null;
 
-const PORT = process.env.PORT || 4242;
+
+const stripe =
+  new Stripe(process.env.STRIPE_SECRET_KEY);
+
+
+const PORT =
+  process.env.PORT || 4242;
+
 
 const INCLUDED_SEATS = 2;
 
-// Price IDs created by setup-products.js
-const priceIdsPath = path.join(__dirname, 'price-ids.json');
+
+// ------------------------------------------------------------------
+// Stripe price IDs
+// ------------------------------------------------------------------
+
+const priceIdsPath =
+  path.join(__dirname, 'price-ids.json');
+
 
 if (!fs.existsSync(priceIdsPath)) {
   console.error(
     'price-ids.json not found. Run `npm run setup-products` first.'
   );
+
   process.exit(1);
 }
 
-const PRICE_IDS = JSON.parse(
-  fs.readFileSync(priceIdsPath, 'utf8')
-);
+
+const PRICE_IDS =
+  JSON.parse(
+    fs.readFileSync(priceIdsPath, 'utf8')
+  );
+
 
 const VALID_TIERS = [
   'grassroots',
   'growing',
   'established'
 ];
+
 
 const TIER_LABELS_FOR_SUCCESS = {
   grassroots: 'Grassroots',
@@ -87,70 +117,104 @@ const TIER_LABELS_FOR_SUCCESS = {
 };
 
 
-// -----------------------------------------------------------------
-// Lightweight durable record of each registration
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
+// Registration log
+// ------------------------------------------------------------------
+//
+// There is no database in this project.
+//
+// Every registration is written to registrations.log.
+// This gives the webhook a complete copy of the attendee list,
+// even when the attendee list is too large for Stripe metadata.
+//
+// ------------------------------------------------------------------
 
-const LOG_PATH = path.join(
-  __dirname,
-  'registrations.log'
-);
+const LOG_PATH =
+  path.join(__dirname, 'registrations.log');
+
 
 function appendRegistrationLog(record) {
+
   fs.promises
     .appendFile(
       LOG_PATH,
       JSON.stringify(record) + '\n'
     )
-    .catch(err =>
+    .catch(err => {
       console.error(
         'Failed to write registration log:',
         err.message
-      )
-    );
+      );
+    });
 }
 
 
+// ------------------------------------------------------------------
+// Find registration by Stripe session ID
+// ------------------------------------------------------------------
+
 function findRegistrationBySessionId(sessionId) {
+
   if (!fs.existsSync(LOG_PATH)) {
     return null;
   }
 
-  const lines = fs
-    .readFileSync(LOG_PATH, 'utf8')
-    .split('\n')
-    .filter(Boolean);
+
+  const lines =
+    fs
+      .readFileSync(LOG_PATH, 'utf8')
+      .split('\n')
+      .filter(Boolean);
+
 
   for (
     let i = lines.length - 1;
     i >= 0;
     i--
   ) {
-    try {
-      const record = JSON.parse(lines[i]);
 
-      if (record.sessionId === sessionId) {
+    try {
+
+      const record =
+        JSON.parse(lines[i]);
+
+
+      if (
+        record.sessionId === sessionId
+      ) {
         return record;
       }
 
     } catch (e) {
-      // Skip malformed lines.
+
+      // Ignore malformed log entries.
+
     }
   }
+
 
   return null;
 }
 
 
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
 // Confirmation email
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
+//
+// Sends the confirmation email to every attendee email address.
+//
+// If no attendee email addresses are available, the primary contact
+// email from Stripe/form data is used as a fallback.
+//
+// ------------------------------------------------------------------
 
 async function sendConfirmationEmail(
   session,
   attendeesList
 ) {
+
   if (!resend) {
+
     console.warn(
       'Skipping confirmation email — RESEND_API_KEY not configured.'
     );
@@ -159,36 +223,54 @@ async function sendConfirmationEmail(
   }
 
 
-  // Send the confirmation to every registered attendee.
-  // Fall back to the primary contact for older registrations.
-  const attendeeEmails = (attendeesList || [])
-    .map(a =>
-      String(a?.email || '').trim()
-    )
-    .filter(Boolean);
+  // ---------------------------------------------------------------
+  // Collect attendee email addresses
+  // ---------------------------------------------------------------
+
+  const attendeeEmails =
+    (attendeesList || [])
+      .map(attendee =>
+        String(
+          attendee?.email || ''
+        ).trim()
+      )
+      .filter(Boolean);
 
 
-  const fallbackEmail = String(
-    session.customer_details?.email ||
-    session.metadata?.contact_email ||
-    ''
-  ).trim();
+  // ---------------------------------------------------------------
+  // Primary contact fallback
+  // ---------------------------------------------------------------
+
+  const fallbackEmail =
+    String(
+      session.customer_details?.email ||
+      session.metadata?.contact_email ||
+      ''
+    ).trim();
+
+
+  // ---------------------------------------------------------------
+  // Send to every unique recipient
+  //
+  // If attendee emails exist, include them.
+  // Also include the primary contact email so the person who paid
+  // receives the confirmation even if they aren't listed as an
+  // attendee.
+  // ---------------------------------------------------------------
+
+  const allEmails = [
+    ...attendeeEmails,
+    ...(fallbackEmail ? [fallbackEmail] : [])
+  ];
 
 
   const toEmails = [
-    ...new Set(
-      attendeeEmails.length
-        ? attendeeEmails
-        : (
-            fallbackEmail
-              ? [fallbackEmail]
-              : []
-          )
-    )
+    ...new Set(allEmails)
   ];
 
 
   if (!toEmails.length) {
+
     console.error(
       'No recipient email found on session',
       session.id
@@ -198,32 +280,44 @@ async function sendConfirmationEmail(
   }
 
 
+  // ---------------------------------------------------------------
+  // Build confirmation email
+  // ---------------------------------------------------------------
+
   const {
     subject,
     html
-  } = buildConfirmationEmail({
-    orgName:
-      session.metadata?.org_name,
+  } =
+    buildConfirmationEmail({
 
-    contactName:
-      session.metadata?.contact_name,
+      orgName:
+        session.metadata?.org_name,
 
-    tier:
-      session.metadata?.tier,
+      contactName:
+        session.metadata?.contact_name,
 
-    attendees:
-      session.metadata?.attendees,
+      tier:
+        session.metadata?.tier,
 
-    attendeesList
-  });
+      attendees:
+        session.metadata?.attendees,
 
+      attendeesList
+    });
+
+
+  // ---------------------------------------------------------------
+  // Send email through Resend
+  // ---------------------------------------------------------------
 
   const result =
     await resend.emails.send({
+
       from:
         'Oversight Management <workshops@oversightmanagement.com>',
 
-      to: toEmails,
+      to:
+        toEmails,
 
       subject,
 
@@ -231,7 +325,10 @@ async function sendConfirmationEmail(
     });
 
 
+  // Resend can return an error without throwing.
+
   if (result.error) {
+
     throw new Error(
       `Resend rejected the send: ${
         result.error.message ||
@@ -239,22 +336,36 @@ async function sendConfirmationEmail(
       }`
     );
   }
+
+
+  console.log(
+    `Confirmation email sent to ${toEmails.length} recipient(s):`,
+    toEmails.join(', ')
+  );
 }
 
 
-// -----------------------------------------------------------------
-// Express
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
+// Express app
+// ------------------------------------------------------------------
 
-const app = express();
+const app =
+  express();
+
 
 app.use(cors());
 
 
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
 // Stripe webhook
-// MUST be registered before express.json()
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
+//
+// IMPORTANT:
+// This MUST be registered before express.json().
+//
+// Stripe requires the raw request body to verify the webhook
+// signature.
+// ------------------------------------------------------------------
 
 app.post(
   '/webhook/stripe',
@@ -265,6 +376,7 @@ app.post(
 
     const sig =
       req.headers['stripe-signature'];
+
 
     let event;
 
@@ -293,6 +405,10 @@ app.post(
     }
 
 
+    // --------------------------------------------------------------
+    // Successful Stripe checkout
+    // --------------------------------------------------------------
+
     if (
       event.type ===
       'checkout.session.completed'
@@ -301,9 +417,17 @@ app.post(
       const session =
         event.data.object;
 
-      const m =
+
+      const metadata =
         session.metadata || {};
 
+
+      // ------------------------------------------------------------
+      // Retrieve the original registration record.
+      //
+      // This is important because the full attendee list is stored
+      // in registrations.log.
+      // ------------------------------------------------------------
 
       const fullRecord =
         findRegistrationBySessionId(
@@ -314,16 +438,22 @@ app.post(
       let attendeesList = [];
 
 
-      // New registrations carry the attendee list
-      // directly in Stripe metadata.
+      // ------------------------------------------------------------
+      // First try the compact attendees_json metadata.
+      //
+      // This exists for registrations where the attendee JSON fits
+      // inside Stripe's metadata value limit.
+      // ------------------------------------------------------------
 
-      if (m.attendees_json) {
+      if (
+        metadata.attendees_json
+      ) {
 
         try {
 
           attendeesList =
             JSON.parse(
-              m.attendees_json
+              metadata.attendees_json
             );
 
         } catch (err) {
@@ -336,7 +466,11 @@ app.post(
       }
 
 
-      // Fallback for older registrations.
+      // ------------------------------------------------------------
+      // Fallback to registrations.log.
+      //
+      // This handles larger attendee lists.
+      // ------------------------------------------------------------
 
       if (
         !attendeesList.length &&
@@ -365,9 +499,9 @@ app.post(
       }
 
 
-      // -------------------------------------------------------------
-      // Confirmation email
-      // -------------------------------------------------------------
+      // ------------------------------------------------------------
+      // Send confirmation email
+      // ------------------------------------------------------------
 
       try {
 
@@ -378,6 +512,10 @@ app.post(
 
       } catch (err) {
 
+        // Do not fail the webhook because of email.
+        //
+        // Payment has already succeeded.
+
         console.error(
           'Confirmation email failed to send:',
           err.message
@@ -385,9 +523,9 @@ app.post(
       }
 
 
-      // -------------------------------------------------------------
-      // Google Sheets
-      // -------------------------------------------------------------
+      // ------------------------------------------------------------
+      // Add registration to Google Sheets
+      // ------------------------------------------------------------
 
       try {
 
@@ -397,58 +535,58 @@ app.post(
             session.id,
 
           tier:
-            m.tier,
+            metadata.tier,
 
           attendees:
-            m.attendees,
+            metadata.attendees,
 
           orgName:
-            m.org_name,
+            metadata.org_name,
 
           orgEin:
-            m.org_ein,
+            metadata.org_ein,
 
           orgType:
-            m.org_type,
+            metadata.org_type,
 
           mission:
-            m.mission,
+            metadata.mission,
 
           address1:
-            m.address1,
+            metadata.address1,
 
           city:
-            m.city,
+            metadata.city,
 
           state:
-            m.state,
+            metadata.state,
 
           zip:
-            m.zip,
+            metadata.zip,
 
           website:
-            m.website,
+            metadata.website,
 
           contactName:
-            m.contact_name,
+            metadata.contact_name,
 
           contactRole:
-            m.contact_role,
+            metadata.contact_role,
 
           contactEmail:
-            m.contact_email,
+            metadata.contact_email,
 
           contactPhone:
-            m.contact_phone,
+            metadata.contact_phone,
 
           contact2Name:
-            m.contact2_name,
+            metadata.contact2_name,
 
           contact2Email:
-            m.contact2_email,
+            metadata.contact2_email,
 
           contact2Phone:
-            m.contact2_phone,
+            metadata.contact2_phone,
 
           attendeesList
         });
@@ -470,7 +608,14 @@ app.post(
 );
 
 
-app.use(express.json());
+// ------------------------------------------------------------------
+// Normal JSON routes
+// ------------------------------------------------------------------
+
+app.use(
+  express.json()
+);
+
 
 app.use(
   express.static(
@@ -479,9 +624,9 @@ app.use(
 );
 
 
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
 // Create Stripe Checkout Session
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
 
 app.post(
   '/create-checkout-session',
@@ -517,6 +662,10 @@ app.post(
       } = req.body;
 
 
+      // ------------------------------------------------------------
+      // Validate tier
+      // ------------------------------------------------------------
+
       if (
         !VALID_TIERS.includes(tier)
       ) {
@@ -530,11 +679,17 @@ app.post(
       }
 
 
+      // ------------------------------------------------------------
+      // Calculate attendees / extra seats
+      // ------------------------------------------------------------
+
       const attendeeCount =
         Math.max(
           1,
-          parseInt(attendees, 10) ||
-          INCLUDED_SEATS
+          parseInt(
+            attendees,
+            10
+          ) || INCLUDED_SEATS
         );
 
 
@@ -546,19 +701,26 @@ app.post(
         );
 
 
+      // ------------------------------------------------------------
+      // Stripe line items
+      // ------------------------------------------------------------
+
       const line_items = [
 
         {
           price:
             PRICE_IDS[tier],
 
-          quantity: 1
+          quantity:
+            1
         }
 
       ];
 
 
-      if (extraSeats > 0) {
+      if (
+        extraSeats > 0
+      ) {
 
         line_items.push({
 
@@ -571,9 +733,18 @@ app.post(
       }
 
 
-      // -------------------------------------------------------------
-      // Store attendee list in Stripe metadata when it fits.
-      // -------------------------------------------------------------
+      // ------------------------------------------------------------
+      // Attendee JSON
+      // ------------------------------------------------------------
+      //
+      // Stripe metadata values have a character limit.
+      //
+      // If the complete attendee JSON fits, store it in metadata.
+      // If it doesn't fit, leave it empty and use registrations.log.
+      //
+      // The complete attendee list is ALWAYS saved to
+      // registrations.log below.
+      // ------------------------------------------------------------
 
       const attendeesJson =
         JSON.stringify(
@@ -589,25 +760,41 @@ app.post(
           : '';
 
 
-      // -------------------------------------------------------------
+      // ------------------------------------------------------------
       // Create Stripe Checkout Session
-      // -------------------------------------------------------------
+      // ------------------------------------------------------------
 
       const session =
         await stripe.checkout.sessions.create({
 
-          mode: 'payment',
+          mode:
+            'payment',
+
 
           line_items,
+
+
+          // --------------------------------------------------------
+          // Success URL
+          // --------------------------------------------------------
 
           success_url:
             process.env.SUCCESS_URL ||
             'http://localhost:4242/success?session_id={CHECKOUT_SESSION_ID}',
 
+
+          // --------------------------------------------------------
+          // Cancel URL
+          // --------------------------------------------------------
+
           cancel_url:
             process.env.CANCEL_URL ||
             'http://localhost:4242/#pricing',
 
+
+          // --------------------------------------------------------
+          // Stripe branding
+          // --------------------------------------------------------
 
           branding_settings: {
 
@@ -625,7 +812,8 @@ app.post(
 
             icon: {
 
-              type: 'url',
+              type:
+                'url',
 
               url:
                 process.env.LOGO_URL ||
@@ -634,8 +822,14 @@ app.post(
           },
 
 
+          // --------------------------------------------------------
+          // Metadata
+          // --------------------------------------------------------
+
           metadata: {
 
+            // Attendee list if it fits within Stripe's
+            // metadata value limit.
             attendees_json:
               attendeeMetadata,
 
@@ -710,15 +904,23 @@ app.post(
           },
 
 
+          // --------------------------------------------------------
+          // Primary Stripe customer email
+          // --------------------------------------------------------
+
           customer_email:
             email || undefined
-
         });
 
 
-      // -------------------------------------------------------------
-      // Save complete registration record.
-      // -------------------------------------------------------------
+      // ------------------------------------------------------------
+      // Save complete registration
+      // ------------------------------------------------------------
+      //
+      // IMPORTANT:
+      // Keep the complete attendee list here even when it is too
+      // large for Stripe metadata.
+      // ------------------------------------------------------------
 
       appendRegistrationLog({
 
@@ -730,7 +932,10 @@ app.post(
         attendees:
           attendeeCount,
 
-        attendeesList,
+        attendeesList:
+          Array.isArray(attendeesList)
+            ? attendeesList
+            : [],
 
         org: {
 
@@ -755,7 +960,6 @@ app.post(
           website
         },
 
-
         primaryContact: {
 
           name:
@@ -767,7 +971,6 @@ app.post(
 
           phone
         },
-
 
         secondaryContact: {
 
@@ -781,14 +984,17 @@ app.post(
             contact2Phone
         },
 
-
         createdAt:
           new Date().toISOString()
-
       });
 
 
+      // ------------------------------------------------------------
+      // Return Stripe Checkout URL to Webflow
+      // ------------------------------------------------------------
+
       res.json({
+
         url:
           session.url
       });
@@ -801,9 +1007,11 @@ app.post(
         err.message
       );
 
+
       res
         .status(400)
         .json({
+
           error:
             err.message ||
             'Could not start checkout. Please try again.'
@@ -813,9 +1021,9 @@ app.post(
 );
 
 
-// -----------------------------------------------------------------
-// Success page
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
+// Confirmation page
+// ------------------------------------------------------------------
 
 function successPage({
   heading,
@@ -926,28 +1134,26 @@ function successPage({
           </h1>
 
 
-          ${
-            lines
-              .map(
-                l => `
-                  <p
-                    style="
-                      font-size:15px;
-                      line-height:24px;
-                      color:${
-                        l.muted
-                          ? '#5b6470'
-                          : '#20272f'
-                      };
-                      margin:0 0 8px;
-                    "
-                  >
-                    ${l.text}
-                  </p>
-                `
-              )
-              .join('')
-          }
+          ${lines
+            .map(
+              line => `
+                <p
+                  style="
+                    font-size:15px;
+                    line-height:24px;
+                    color:${
+                      line.muted
+                        ? '#5b6470'
+                        : '#20272f'
+                    };
+                    margin:0 0 8px;
+                  "
+                >
+                  ${line.text}
+                </p>
+              `
+            )
+            .join('')}
 
         </div>
 
@@ -960,9 +1166,19 @@ function successPage({
 }
 
 
-// -----------------------------------------------------------------
-// Stripe success verification
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
+// Verified success page
+// ------------------------------------------------------------------
+//
+// Stripe redirects here with:
+//
+// ?session_id={CHECKOUT_SESSION_ID}
+//
+// We NEVER show "registered" merely because the URL was visited.
+//
+// We retrieve the real Stripe Checkout Session and check:
+// payment_status === 'paid'
+// ------------------------------------------------------------------
 
 app.get(
   '/success',
@@ -972,7 +1188,10 @@ app.get(
       req.query.session_id;
 
 
-    // No session ID.
+    // --------------------------------------------------------------
+    // No session ID
+    // --------------------------------------------------------------
+
     if (!sessionId) {
 
       return res
@@ -1002,16 +1221,16 @@ app.get(
               }
 
             ]
-
           })
         );
     }
 
 
-    try {
+    // --------------------------------------------------------------
+    // Verify the Stripe session
+    // --------------------------------------------------------------
 
-      // Ask Stripe directly whether this
-      // specific session was actually paid.
+    try {
 
       const session =
         await stripe.checkout.sessions.retrieve(
@@ -1019,8 +1238,13 @@ app.get(
         );
 
 
+      // ------------------------------------------------------------
+      // Payment wasn't completed
+      // ------------------------------------------------------------
+
       if (
-        session.payment_status !== 'paid'
+        session.payment_status !==
+        'paid'
       ) {
 
         return res
@@ -1050,11 +1274,14 @@ app.get(
                 }
 
               ]
-
             })
           );
       }
 
+
+      // ------------------------------------------------------------
+      // Payment is confirmed
+      // ------------------------------------------------------------
 
       const orgName =
         session.metadata?.org_name ||
@@ -1071,16 +1298,18 @@ app.get(
 
       const amount =
         typeof session.amount_total === 'number'
-
           ? `$${(
-              session.amount_total /
-              100
+              session.amount_total / 100
             ).toFixed(2)}`
-
           : '';
 
 
+      // ------------------------------------------------------------
+      // Render confirmed registration
+      // ------------------------------------------------------------
+
       res.send(
+
         successPage({
 
           heading:
@@ -1103,7 +1332,7 @@ app.get(
 
             {
               text:
-                'A receipt has been emailed to you.',
+                'A confirmation email has been sent to the registered email addresses.',
 
               muted:
                 true
@@ -1125,6 +1354,10 @@ app.get(
 
     } catch (err) {
 
+      // ------------------------------------------------------------
+      // Stripe session could not be verified
+      // ------------------------------------------------------------
+
       console.error(
         'Could not verify checkout session on /success:',
         err.message
@@ -1134,6 +1367,7 @@ app.get(
       res
         .status(500)
         .send(
+
           successPage({
 
             heading:
@@ -1160,38 +1394,46 @@ app.get(
             ]
 
           })
+
         );
     }
   }
 );
 
 
-// -----------------------------------------------------------------
-// JSON error handler
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
+// Clean JSON error responses
+// ------------------------------------------------------------------
 
 app.use(
-  (err, req, res, next) => {
+  (
+    err,
+    req,
+    res,
+    next
+  ) => {
 
     if (err) {
 
       return res
         .status(400)
         .json({
+
           error:
             err.message ||
             'Something went wrong.'
         });
     }
 
+
     next();
   }
 );
 
 
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
 // Start server
-// -----------------------------------------------------------------
+// ------------------------------------------------------------------
 
 app.listen(
   PORT,
