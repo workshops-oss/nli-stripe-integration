@@ -1337,14 +1337,21 @@ app.get(
               muted:
                 true
             },
+{
+  text:
+    'Looking forward to seeing you at the Nonprofit Leadership Intensive.',
 
-            {
-              text:
-                'Looking forward to seeing you at the Nonprofit Leadership Intensive.',
+  muted:
+    true
+},
 
-              muted:
-                true
-            }
+{
+  text:
+    '<a href="https://www.oversightmanagement.com" target="_blank" rel="noopener noreferrer" style="color:#1c3a5e; text-decoration:underline;">www.OversightManagement.com</a>',
+
+  muted:
+    true
+}
 
           ]
 
