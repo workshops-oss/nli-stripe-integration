@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Nonprofit Leadership Intensive">
+  <circle cx="60" cy="60" r="55" fill="none" stroke="#1C3A5E" stroke-width="3.2"/>
+  <circle cx="60" cy="60" r="47.5" fill="none" stroke="#D98A9E" stroke-width="1.5"/>
+  <rect x="38" y="71" width="44" height="3" rx="1.5" fill="#1C3A5E"/>
+  <rect x="42.5" y="54" width="9" height="17" rx="4.5" fill="#1C3A5E"/>
+  <rect x="68.5" y="54" width="9" height="17" rx="4.5" fill="#1C3A5E"/>
+  <rect x="55.5" y="42" width="9" height="29" rx="4.5" fill="#1C3A5E"/>
+  <path d="M60 43 v-8" stroke="#9B2D3A" stroke-width="2.6" stroke-linecap="round" fill="none"/>
+  <path d="M60 36 C 64 28, 71 24, 75 27 C 73 34, 65 38, 60 36 Z" fill="#9B2D3A"/>
+  <path d="M60 36 C 56 28, 49 24, 45 27 C 47 34, 55 38, 60 36 Z" fill="#D98A9E"/>
+  <circle cx="50" cy="84" r="6.3" fill="none" stroke="#1C3A5E" stroke-width="3.4"/>
+  <path d="M60 90 L60 78 L67 86 L74 78 L74 90" fill="none" stroke="#9B2D3A" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
