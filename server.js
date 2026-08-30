@@ -617,11 +617,11 @@ app.use(
 );
 
 
-app.use(
-  express.static(
-    path.join(__dirname, 'public')
-  )
-);
+app.get('/nli-mark-reversed.png', (req, res) => {
+  res.sendFile(
+    path.join(__dirname, 'nli-mark-reversed.png')
+  );
+});
 
 
 // ------------------------------------------------------------------
